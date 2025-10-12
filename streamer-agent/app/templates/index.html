@@ -1,0 +1,32 @@
+<!-- app/templates/index.html -->
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>RadioTiker Streamer</title>
+</head>
+<body>
+  <h1>🎶 RadioTiker Streamer Agent</h1>
+
+  <form action="/scan" method="post">
+    <label>Music Folder Path:</label>
+    <input type="text" name="path" placeholder="/mnt/nas/Music" required>
+    <button type="submit">Scan Folder</button>
+  </form>
+
+  <form action="/queue" method="post" style="margin-top: 1em;">
+    <button type="submit">Build Play Queue</button>
+  </form>
+
+  <form action="/stream" method="post" style="margin-top: 1em;">
+    <button type="submit">Start Streaming</button>
+  </form>
+
+  <h2>Scanned Tracks</h2>
+  <ul>
+    {% for track in tracks %}
+      <li>{{ track.title }} – {{ track.artist }} ({{ track.album }})</li>
+    {% endfor %}
+  </ul>
+</body>
+</html>

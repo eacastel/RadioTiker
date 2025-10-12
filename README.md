@@ -50,6 +50,35 @@ python scripts/mp3_checker.py
 
 python scripts/fetch_metadata.py --title "Imagine" --artist "John Lennon"
 
+
+
+# Streamer Agent for RadioTiker
+
+This is the local streamer agent for RadioTiker. It allows users to scan their own music folders, build a play queue, and stream their music live to a remote Icecast server — **without uploading or storing any files** on the platform.
+
+---
+
+## Features
+
+- Scans music folder for valid audio files
+- Extracts metadata using `mutagen`
+- Builds a randomized or ordered play queue
+- Streams audio live to Icecast using `ffmpeg`
+- Lightweight and private: no files are copied or stored externally
+
+---
+
+## Requirements
+
+- Python 3.8+
+- `ffmpeg` installed on the system (use `apt`, `brew`, or download)
+
+Install Python requirements:
+
+```bash
+pip install -r requirements.txt
+
+
 # Coming Soon
 Batch metadata import and storage
 FastAPI-based metadata API
