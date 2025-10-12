@@ -144,10 +144,10 @@ def player(user_id: str):
 <html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>RadioTiker – {user_id}</title>
 <style>
- body{{font-family:system-ui,Segoe UI,Roboto,Arial;padding:24px}}
- table{{width:100%;border-collapse:collapse;margin-top:12px}}
- th,td{{border-bottom:1px solid #eee;padding:8px;text-align:left}}
- thead th{{background:#fafafa}}
+ body{{{{font-family:system-ui,Segoe UI,Roboto,Arial;padding:24px}}}}
+ table{{{{width:100%;border-collapse:collapse;margin-top:12px}}}}
+ th,td{{{{border-bottom:1px solid #eee;padding:8px;text-align:left}}}}
+ thead th{{{{background:#fafafa}}}}
 </style></head>
 <body>
 <h1>RadioTiker – Player</h1>
@@ -164,19 +164,18 @@ def player(user_id: str):
 </table>
 
 <script>
-const userId = {json.dumps(user_id)};
-function playId(tid){{
-  const url = `/streamer/api/relay/${{userId}}/${{tid}}?v=${libver()}`;
+function libver() {{
+  return Math.floor(Date.now()/1000); // cache-bust key
+}}
+const userId = "{user_id}";
+function playId(tid) {{
+  const url = `/streamer/api/relay/${{userId}}/${{tid}}?v=${{libver()}}`;
   const audio = document.getElementById('player');
   const src = document.getElementById('src');
   src.src = url;
   audio.load();
   audio.play().catch(()=>{{}});
   document.getElementById('now').innerText = tid;
-}}
-function libver(){{
-  // Cheap cache-bust: current seconds
-  return Math.floor(Date.now()/1000);
 }}
 </script>
 </body></html>"""
