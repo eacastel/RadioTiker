@@ -1,9 +1,11 @@
+# app/main.py
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
 import json, time, requests
+from urllib.parse import urlparse, unquote
 
 app = FastAPI(title="RadioTiker Streamer API")
 
@@ -12,27 +14,16 @@ DATA_DIR = ROOT / "data" / "user-libraries"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # in-memory
-LIBS: Dict[str, Dict[str, Any]] = {}  # user_id -> {"tracks": {track_id: track}, "version": int}
-
-class Track(BaseModel):
-    title: Optional[str] = None
-    artist: Optional[str] = None
-    album: Optional[str] = None
-    path: Optional[str] = None
-    stream_url: Optional[str] = None
-    file_size: Optional[int] = None
-    mtime: Optional[int] = None
-    duration_sec: Optional[float] = None
-    track_id: str
-
-class ScanPayload(BaseModel):
-    user_id: str
-    library: List[Track]
-    library_version: Optional[int] = None
+LIBS: Dict[str, Dict[str, Any]] = {}   # user_id -> {"tracks": {track_id: track}, "version": int}
+AGENTS: Dict[str, Dict[str, Any]] = {} # user_id -> {"base_url": str, "last_seen": int}
 
 def store_path(user_id: str) -> Path:
     safe = "".join(ch for ch in user_id if ch.isalnum() or ch in ("-", "_", "."))
     return DATA_DIR / f"{safe}.json"
+
+def agent_path(user_id: str) -> Path:
+    safe = "".join(ch for ch in user_id if ch.isalnum() or ch in ("-", "_", "."))
+    return DATA_DIR / f"{safe}.agent.json"
 
 def load_lib(user_id: str) -> Dict[str, Any]:
     if user_id in LIBS:
@@ -53,35 +44,96 @@ def save_lib(user_id: str, lib: Dict[str, Any]):
     LIBS[user_id] = lib
     store_path(user_id).write_text(json.dumps(lib, indent=2))
 
+def load_agent(user_id: str) -> Dict[str, Any]:
+    if user_id in AGENTS:
+        return AGENTS[user_id]
+    p = agent_path(user_id)
+    if p.exists():
+        try:
+            AGENTS[user_id] = json.loads(p.read_text())
+            return AGENTS[user_id]
+        except Exception:
+            pass
+    AGENTS[user_id] = {}
+    return AGENTS[user_id]
+
+def save_agent(user_id: str, st: Dict[str, Any]):
+    AGENTS[user_id] = st
+    agent_path(user_id).write_text(json.dumps(st, indent=2))
+
+class Track(BaseModel):
+    title: Optional[str] = None
+    artist: Optional[str] = None
+    album: Optional[str] = None
+    path: Optional[str] = None
+    rel_path: Optional[str] = None   # <— NEW canonical path under agent root
+    stream_url: Optional[str] = None # legacy, used once to derive rel_path
+    file_size: Optional[int] = None
+    mtime: Optional[int] = None
+    duration_sec: Optional[float] = None
+    track_id: str
+
+class ScanPayload(BaseModel):
+    user_id: str
+    library: List[Track]
+    library_version: Optional[int] = None
+
+class AnnouncePayload(BaseModel):
+    user_id: str
+    base_url: str
+
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+@app.post("/api/agent/announce")
+def agent_announce(payload: AnnouncePayload):
+    st = load_agent(payload.user_id)
+    st["base_url"] = payload.base_url.rstrip("/")
+    st["last_seen"] = int(time.time())
+    save_agent(payload.user_id, st)
+    return {"ok": True, "base_url": st["base_url"]}
 
 @app.post("/api/submit-scan")
 def submit_scan(payload: ScanPayload):
     lib = load_lib(payload.user_id)
     tracks = lib["tracks"]
 
-    # Upsert each by track_id
     for t in payload.library:
         d = t.model_dump()
+        # migrate legacy stream_url -> rel_path once
+        if not d.get("rel_path") and d.get("stream_url"):
+            p = urlparse(d["stream_url"])
+            rel_guess = unquote(p.path.lstrip("/"))
+            d["rel_path"] = rel_guess
+        d.pop("stream_url", None)  # do not persist stale URLs
         tracks[d["track_id"]] = d
 
-    # bump version each submit (or use provided version)
     lib["version"] = payload.library_version or int(time.time())
     save_lib(payload.user_id, lib)
 
     preview = []
     for i, (_, v) in enumerate(tracks.items()):
         if i >= 3: break
-        preview.append({k: v.get(k) for k in ("title", "artist", "track_id", "stream_url")})
+        preview.append({k: v.get(k) for k in ("title", "artist", "track_id", "rel_path")})
 
-    return {"ok": True, "user_id": payload.user_id, "count": len(tracks), "version": lib["version"], "preview": preview}
+    st = load_agent(payload.user_id)
+    return {"ok": True, "user_id": payload.user_id, "count": len(tracks),
+            "version": lib["version"], "agent_base_url": st.get("base_url"),
+            "preview": preview}
 
 @app.get("/api/library/{user_id}")
 def get_library(user_id: str):
     lib = load_lib(user_id)
     return {"version": lib["version"], "tracks": list(lib["tracks"].values())}
+
+def build_stream_url(user_id: str, t: Dict[str, Any]) -> Optional[str]:
+    st = load_agent(user_id)
+    base = st.get("base_url")
+    rel = t.get("rel_path")
+    if not base or not rel:
+        return None
+    return f"{base}/{rel}"
 
 @app.get("/relay/{user_id}/{track_id}")
 def relay(user_id: str, track_id: str, request: Request):
@@ -90,11 +142,11 @@ def relay(user_id: str, track_id: str, request: Request):
     if not track:
         raise HTTPException(status_code=404, detail="Unknown track_id")
 
-    url = track.get("stream_url")
+    url = build_stream_url(user_id, track)
     if not url:
-        raise HTTPException(status_code=400, detail="No stream_url for this track")
+        raise HTTPException(status_code=503, detail="Agent offline or base_url/rel_path unknown")
 
-    headers = {"User-Agent": "RadioTiker-Relay/0.2"}
+    headers = {"User-Agent": "RadioTiker-Relay/0.3"}
     rng = request.headers.get("range")
     if rng:
         headers["Range"] = rng
@@ -109,8 +161,6 @@ def relay(user_id: str, track_id: str, request: Request):
     for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control", "ETag", "Last-Modified"]:
         v = upstream.headers.get(k)
         if v: passthrough[k] = v
-
-    # discourage client/proxy caching so new scans take effect immediately
     passthrough.setdefault("Cache-Control", "no-store")
 
     def gen():
@@ -118,7 +168,7 @@ def relay(user_id: str, track_id: str, request: Request):
             if chunk:
                 yield chunk
 
-    status = upstream.status_code  # 200 or 206
+    status = upstream.status_code
     media = upstream.headers.get("Content-Type") or "audio/mpeg"
     return StreamingResponse(gen(), media_type=media, headers=passthrough, status_code=status)
 
@@ -129,7 +179,7 @@ def player(user_id: str):
     for t in lib["tracks"].values():
         title = t.get("title") or "Unknown Title"
         artist = t.get("artist") or "Unknown Artist"
-        mark = "✅" if t.get("stream_url") else "—"
+        mark = "✅" if t.get("rel_path") else "—"
         rows.append(f"""
           <tr>
             <td>{title}</td>
@@ -144,10 +194,10 @@ def player(user_id: str):
 <html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>RadioTiker – {user_id}</title>
 <style>
- body{{{{font-family:system-ui,Segoe UI,Roboto,Arial;padding:24px}}}}
- table{{{{width:100%;border-collapse:collapse;margin-top:12px}}}}
- th,td{{{{border-bottom:1px solid #eee;padding:8px;text-align:left}}}}
- thead th{{{{background:#fafafa}}}}
+ body{{font-family:system-ui,Segoe UI,Roboto,Arial;padding:24px}}
+ table{{width:100%;border-collapse:collapse;margin-top:12px}}
+ th,td{{border-bottom:1px solid #eee;padding:8px;text-align:left}}
+ thead th{{background:#fafafa}}
 </style></head>
 <body>
 <h1>RadioTiker – Player</h1>
@@ -159,14 +209,12 @@ def player(user_id: str):
 <div style="margin-top:10px"><b>Now Playing:</b> <span id="now">—</span></div>
 
 <table>
-<thead><tr><th>Title</th><th>Artist</th><th>URL?</th><th>Action</th></tr></thead>
+<thead><tr><th>Title</th><th>Artist</th><th>OK?</th><th>Action</th></tr></thead>
 <tbody>{rows_html}</tbody>
 </table>
 
 <script>
-function libver() {{
-  return Math.floor(Date.now()/1000); // cache-bust key
-}}
+function libver() {{ return Math.floor(Date.now()/1000); }}
 const userId = "{user_id}";
 function playId(tid) {{
   const url = `/streamer/api/relay/${{userId}}/${{tid}}?v=${{libver()}}`;
