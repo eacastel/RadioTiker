@@ -17,13 +17,13 @@ APP_VERSION = "0.2"
 
 load_dotenv()
 
+# NOTE: points to the proxied FastAPI path
 SERVER_URL = os.getenv("SERVER_URL", "https://radio.tiker.es/streamer/api/submit-scan")
 
 CONF_DIR = Path.home() / ".radiotiker"
 CONF_DIR.mkdir(parents=True, exist_ok=True)
 CONF_FILE = CONF_DIR / "agent.json"
 
-# Normalize extensions: allow commas with spaces
 VALID_EXTENSIONS = tuple(
     ext.strip().lower()
     for ext in os.getenv("VALID_AUDIO_EXTENSIONS", ".mp3,.flac,.wav,.m4a").split(",")
@@ -31,7 +31,7 @@ VALID_EXTENSIONS = tuple(
 )
 
 DEFAULT_PORT = int(os.getenv("AGENT_PORT", "8765"))
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # if set, overrides LAN autodetect
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # optional override (e.g., Cloudflare Tunnel)
 
 def get_user_id_interactive(default_val="user-001"):
     try:
@@ -67,25 +67,34 @@ def _file_fingerprint(path: str) -> tuple[int, int]:
     return (st.st_size, int(st.st_mtime))
 
 def _track_id(path: str, size: int, mtime: int) -> str:
-    # stable id for caching: path|size|mtime
     h = hashlib.sha1()
     h.update(path.encode("utf-8", "ignore"))
-    h.update(b"|")
-    h.update(str(size).encode())
-    h.update(b"|")
-    h.update(str(mtime).encode())
+    h.update(b"|"); h.update(str(size).encode())
+    h.update(b"|"); h.update(str(mtime).encode())
     return h.hexdigest()
 
 def _duration_seconds(path: str):
     try:
-        mf = MutagenFile(path)  # non-easy for precise info
+        mf = MutagenFile(path)
         return round(float(getattr(mf.info, "length", 0.0)), 3) if mf and getattr(mf, "info", None) else None
     except Exception:
         return None
 
-def scan_folder(folder_path, log_fn, url_builder=None):
+# --- NEW: tell server our base_url so it can build stream URLs dynamically ---
+def announce_agent(user_id: str, base_url: str, log_fn):
+    # derive /api/agent/announce from SERVER_URL
+    from urllib.parse import urljoin
+    announce_url = urljoin(SERVER_URL, "../agent/announce")  # -> /streamer/api/agent/announce
+    payload = {"user_id": user_id, "base_url": base_url}
+    try:
+        r = requests.post(announce_url, json=payload, timeout=10)
+        log_fn(f"📣 Announce: {r.status_code} {r.text[:200]}\n")
+    except Exception as e:
+        log_fn(f"❌ Announce failed: {e}\n")
+
+def scan_folder(folder_path, log_fn):
     lib = []
-    # pre-count for nicer progress
+    # pre-count
     total = 0
     for root, _, files in os.walk(folder_path):
         for fname in files:
@@ -101,28 +110,25 @@ def scan_folder(folder_path, log_fn, url_builder=None):
             full_path = os.path.join(root, fname)
             try:
                 size, mtime = _file_fingerprint(full_path)
-
-                # fast tags (easy=True)
                 easy = MutagenFile(full_path, easy=True)
                 title  = (easy.get("title",  [os.path.splitext(fname)[0]]) or [None])[0] if easy else os.path.splitext(fname)[0]
                 artist = (easy.get("artist", ["Unknown"])              or ["Unknown"])[0] if easy else "Unknown"
                 album  = (easy.get("album",  ["Unknown"])              or ["Unknown"])[0] if easy else "Unknown"
-
                 dur = _duration_seconds(full_path)
+
+                rel = os.path.relpath(full_path, folder_path).replace(os.sep, "/")  # <— NEW
 
                 rec = {
                     "title": title,
                     "artist": artist,
                     "album": album,
                     "path": full_path,
+                    "rel_path": rel,                 # <— NEW (no stream_url)
                     "file_size": size,
                     "mtime": mtime,
                     "duration_sec": dur,
                     "track_id": _track_id(full_path, size, mtime),
                 }
-                if url_builder:
-                    rec["stream_url"] = url_builder(full_path)
-
                 lib.append(rec)
                 count += 1
                 if count % 25 == 0 or count == total:
@@ -177,22 +183,22 @@ class AgentGUI:
             messagebox.showerror("Error", "Invalid folder path")
             return
 
-        # spin local file server (PUBLIC_BASE_URL -> else autodetect IP)
         try:
             if self.file_server:
                 self.file_server.stop()
             self.file_server = LocalFileServer(root_dir=path, port=DEFAULT_PORT, public_base_url=PUBLIC_BASE_URL)
             self.file_server.start()
-            self.log(f"📡 Local file server: {self.file_server.base_url()}\n")
+            base = self.file_server.base_url()
+            self.log(f"📡 Local file server: {base}\n")
+            announce_agent(USER_ID, base, self.log)     # <— NEW
         except Exception as e:
             self.log(f"❌ Could not start local file server: {e}\n")
             return
 
         def work():
-            tracks = scan_folder(path, self.log, url_builder=self.file_server.path_to_url)
+            tracks = scan_folder(path, self.log)
             self.log(f"🎵 Found {len(tracks)} valid audio files.\n")
             send_to_server(USER_ID, tracks, self.log)
-
         threading.Thread(target=work, daemon=True).start()
 
 # --- splash + headless ---
@@ -203,19 +209,19 @@ def run_headless():
         return
     fs = LocalFileServer(root_dir=path, port=DEFAULT_PORT, public_base_url=PUBLIC_BASE_URL)
     fs.start()
-    print(f"📡 Local file server: {fs.base_url()}")
-    tracks = scan_folder(path, print, url_builder=fs.path_to_url)
+    base = fs.base_url()
+    print(f"📡 Local file server: {base}")
+    announce_agent(USER_ID, base, print)
+    tracks = scan_folder(path, print)
     print(f"🎵 Found {len(tracks)} tracks. Sending to server…")
     send_to_server(USER_ID, tracks, print)
     print("✅ Done. Press Ctrl+C to quit; server stays up so streaming works.")
     try:
-        while True:
-            time.sleep(3600)
+        while True: time.sleep(3600)
     except KeyboardInterrupt:
         fs.stop()
 
 if __name__ == "__main__":
-    # If no DISPLAY => headless (Linux/macOS). On Windows, DISPLAY isn't set, but GUI is okay.
     if not os.environ.get("DISPLAY") and os.name != "nt":
         run_headless()
     else:

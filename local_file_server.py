@@ -39,6 +39,20 @@ def _tailscale_ip() -> str | None:
         pass
     return None
 
+def _tailscale_iface_ip() -> str | None:
+    # Fallback if the CLI isn't available but the iface exists.
+    try:
+        import fcntl, struct
+        iface = "tailscale0"
+        if not os.path.exists(f"/sys/class/net/{iface}"):
+            return None
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        return socket.inet_ntoa(fcntl.ioctl(
+            s.fileno(), 0x8915, struct.pack('256s', iface[:15].encode('utf-8'))
+        )[20:24])
+    except Exception:
+        return None
+
 class LocalFileServer:
     """
     Serves files under root_dir over HTTP.
@@ -59,7 +73,7 @@ class LocalFileServer:
         if self.public_base_url:
             return self.public_base_url  # already full URL like http://host:port
         if not self._chosen_ip:
-            self._chosen_ip = _tailscale_ip() or _lan_ip_fallback()
+            self._chosen_ip = _tailscale_ip() or _tailscale_iface_ip() or _lan_ip_fallback()
         return f"http://{self._chosen_ip}:{self.port}"
 
     def base_url(self) -> str:

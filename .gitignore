@@ -6,7 +6,6 @@ __pycache__/
 *.swp
 .venv/
 .env
-.env.*
 
 # Logs
 *.log
