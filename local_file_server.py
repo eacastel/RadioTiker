@@ -5,7 +5,7 @@ from socketserver import TCPServer
 from urllib.parse import quote
 
 class _QuietHandler(SimpleHTTPRequestHandler):
-    def log_message(self, format, *args):  # quieter logs
+    def log_message(self, format, *args):
         pass
 
 class _RootedTCPServer(TCPServer):
@@ -25,13 +25,9 @@ def _lan_ip_fallback() -> str:
     return ip
 
 def _tailscale_ip() -> str | None:
-    # Works if tailscale is installed + logged in. Returns first IPv4 (100.x.y.z)
     try:
-        out = subprocess.run(
-            ["tailscale", "ip", "-4"],
-            capture_output=True, text=True, check=True, timeout=2
-        ).stdout.strip().splitlines()
-        for line in out:
+        out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, check=True, timeout=2).stdout
+        for line in out.strip().splitlines():
             ip = line.strip()
             if ip.startswith("100."):
                 return ip
@@ -40,16 +36,13 @@ def _tailscale_ip() -> str | None:
     return None
 
 def _tailscale_iface_ip() -> str | None:
-    # Fallback if the CLI isn't available but the iface exists.
     try:
         import fcntl, struct
         iface = "tailscale0"
         if not os.path.exists(f"/sys/class/net/{iface}"):
             return None
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        return socket.inet_ntoa(fcntl.ioctl(
-            s.fileno(), 0x8915, struct.pack('256s', iface[:15].encode('utf-8'))
-        )[20:24])
+        return socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack('256s', iface[:15].encode()))[20:24])
     except Exception:
         return None
 
@@ -59,7 +52,7 @@ class LocalFileServer:
     Base URL priority:
       1) PUBLIC_BASE_URL env (full http(s)://host:port)
       2) Tailscale IP (100.x.x.x)
-      3) LAN IP fallback
+      3) LAN IP
     """
     def __init__(self, root_dir: str, port: int = 8765, public_base_url: str | None = None):
         self.root_dir = os.path.abspath(root_dir)
@@ -67,28 +60,28 @@ class LocalFileServer:
         self.public_base_url = public_base_url.rstrip("/") if public_base_url else None
         self._httpd = None
         self._thread = None
-        self._chosen_ip = None  # memoize
+        self._chosen_ip = None
 
-    def _base_host(self) -> str:
+    def _choose_ip(self) -> str:
         if self.public_base_url:
-            return self.public_base_url  # already full URL like http://host:port
+            return self.public_base_url  # already a full base URL
         if not self._chosen_ip:
             self._chosen_ip = _tailscale_ip() or _tailscale_iface_ip() or _lan_ip_fallback()
         return f"http://{self._chosen_ip}:{self.port}"
 
     def base_url(self) -> str:
-        return self._base_host()
+        return self._choose_ip()
 
     def path_to_url(self, abs_path: str) -> str:
         rel = os.path.relpath(os.path.abspath(abs_path), self.root_dir).replace(os.sep, "/")
         encoded = "/".join(quote(p) for p in rel.split("/"))
-        return f"{self._base_host()}/{encoded}"
+        return f"{self._choose_ip()}/{encoded}"
 
     def start(self):
         if not os.path.isdir(self.root_dir):
             raise RuntimeError(f"LocalFileServer root does not exist: {self.root_dir}")
-        handler_cls = lambda *args, **kw: _QuietHandler(*args, directory=self.root_dir, **kw)
-        self._httpd = _RootedTCPServer(("0.0.0.0", self.port), handler_cls)
+        handler = lambda *a, **k: _QuietHandler(*a, directory=self.root_dir, **k)
+        self._httpd = _RootedTCPServer(("0.0.0.0", self.port), handler)
         def run():
             try: self._httpd.serve_forever()
             except Exception: pass
