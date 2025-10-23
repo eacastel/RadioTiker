@@ -180,30 +180,82 @@ def send_in_batches(user_id: str, tracks: list, log_fn, batch_size=300, replace=
             log_fn(f"❌ Batch {i+1}-{i+len(chunk)} failed: {e}\n")
             break
 
+def _remember_root(path: str):
+    st = read_state()
+    st["last_root"] = path
+    write_state(st)
+
+def tailscale_ok() -> bool:
+    try:
+        import subprocess
+        out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=2)
+        ip = (out.stdout or "").strip().splitlines()[0] if out.returncode == 0 else ""
+        return ip.startswith("100.")
+    except Exception:
+        return False
+
+class _ServerHolder:
+    """Keeps one LocalFileServer instance alive across operations."""
+    def __init__(self):
+        self.server = None
+
+def _start_local_server(root: str, log_fn, holder: _ServerHolder, port: int, public_base_url: str | None) -> str:
+    if holder.server:
+        try:
+            holder.server.stop()
+        except Exception:
+            pass
+    holder.server = LocalFileServer(root_dir=root, port=port, public_base_url=public_base_url)
+    holder.server.start()
+    base = holder.server.base_url()
+    log_fn(f"📡 Local file server: {base}\n")
+    return base
+
+
 # ---------- GUI ----------
 class AgentGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title(f"{APP_NAME} v{APP_VERSION} — user: {USER_ID}")
+        self.root.title(f"{APP_NAME} v{APP_VERSION}")
 
-        # Set initial value ONCE with default root
-        self.path_var = tk.StringVar(value=_default_root())
+        self._server_holder = _ServerHolder()
 
         row = 0
+        # Top line: user label inside the app
+        tk.Label(root, text=f"User: {USER_ID}", font=("Helvetica", 11, "bold")).grid(row=row, column=0, sticky="w", padx=10, pady=(10,4), columnspan=2)
+        row += 1
+
+        # Music folder selector
+        self.path_var = tk.StringVar(value=_default_root())
         tk.Label(root, text="Music folder:").grid(row=row, column=0, sticky="w", padx=10, pady=6)
         self.e_path = tk.Entry(root, textvariable=self.path_var, width=56)
-        self.e_path.grid(row=row, column=1, padx=6, pady=6)
+        self.e_path.grid(row=row, column=1, padx=6, pady=6, sticky="we")
         tk.Button(root, text="Browse", command=self.browse).grid(row=row, column=2, padx=4)
         row += 1
 
+        # Scan button
         self.btn = tk.Button(root, text="Scan and Send", command=self.scan_and_send)
-        self.btn.grid(row=row, column=0, columnspan=3, pady=8)
+        self.btn.grid(row=row, column=0, columnspan=3, pady=8, sticky="w")
         row += 1
 
+        # Log window
         self.log_box = scrolledtext.ScrolledText(root, width=78, height=20)
-        self.log_box.grid(row=row, column=0, columnspan=3, padx=10, pady=8)
+        self.log_box.grid(row=row, column=0, columnspan=3, padx=10, pady=8, sticky="nsew")
+        row += 1
 
-        self.file_server = None
+        # Status bar with Tailscale LED + connection state
+        self.status_var = tk.StringVar(value="Status: starting…")
+        self.led = tk.Canvas(root, width=12, height=12, highlightthickness=0)
+        self.led.grid(row=row, column=0, sticky="w", padx=(10,4))
+        tk.Label(root, textvariable=self.status_var).grid(row=row, column=1, sticky="w")
+        row += 1
+
+        # grid weights
+        root.grid_columnconfigure(1, weight=1)
+        root.grid_rowconfigure(3, weight=1)  # log box grows
+
+        # auto-connect (serve + announce remembered root) a moment after UI shows
+        self.root.after(300, self.auto_connect)
 
     def log(self, s:str):
         self.log_box.insert(tk.END, s)
@@ -215,6 +267,27 @@ class AgentGUI:
         folder = filedialog.askdirectory(initialdir=initial, mustexist=True)
         if folder:
             self.path_var.set(folder)
+    
+    def _set_led(self, ok: bool):
+        self.led.delete("all")
+        color = "#16a34a" if ok else "#dc2626"  # green / red
+        self.led.create_oval(2, 2, 10, 10, fill=color, outline=color)
+
+    def auto_connect(self):
+        # choose a root (env LIBRARY_PATH > last_root > $HOME)
+        path = _default_root()
+        self.path_var.set(path)
+        ok = tailscale_ok()
+        self._set_led(ok)
+
+        try:
+            base = _start_local_server(path, self.log, self._server_holder, DEFAULT_PORT, PUBLIC_BASE_URL)
+            announce_agent(USER_ID, base, self.log)
+            _remember_root(path)
+            self.status_var.set("Status: connected (serving)")
+        except Exception as e:
+            self.status_var.set("Status: error starting file server")
+            self.log(f"❌ Could not start local file server: {e}\n")
 
     def scan_and_send(self):
         path = self.path_var.get()
@@ -222,33 +295,39 @@ class AgentGUI:
             messagebox.showerror("Error", "Invalid folder path")
             return
 
-        # Warm up automounts (NAS) so the first list doesn’t look empty
+        # warm NAS mount
         try:
             _ = os.listdir(path)
         except Exception as e:
             self.log(f"⚠️ Could not list '{path}': {e}\n")
 
-        # Detect root change
         prev_root = get_last_root()
         replacing = False
+
         if prev_root and os.path.abspath(prev_root) != os.path.abspath(path):
+            # switched root → recommend replace
             msg = (
                 "You selected a NEW library root.\n\n"
                 "This will REPLACE the previously uploaded library on the server.\n"
-                "Proceed with a full re-scan?"
+                "Proceed with a full re-scan and replace?"
             )
-            if not messagebox.askyesno("Switch library root", msg, icon="warning"):
-                return
-            replacing = True
+            replacing = messagebox.askyesno("Switch library root", msg, icon="warning")
+            if not replacing:
+                # user declined replacement; still rescan without clearing?
+                if not messagebox.askyesno("Rescan without replacing?",
+                                           "Proceed to rescan and append (no clear)?"):
+                    return
+        else:
+            # same root → ask whether to CLEAR existing first
+            replacing = messagebox.askyesno(
+                "Rescan library",
+                "Do you want to CLEAR the existing server library first?\n\n"
+                "Yes = hard reset, No = append/update"
+            )
 
-        # start local file server + announce
+        # (re)start local file server & announce (ensures base_url fresh)
         try:
-            if self.file_server:
-                self.file_server.stop()
-            self.file_server = LocalFileServer(root_dir=path, port=DEFAULT_PORT, public_base_url=PUBLIC_BASE_URL)
-            self.file_server.start()
-            base = self.file_server.base_url()
-            self.log(f"📡 Local file server: {base}\n")
+            base = _start_local_server(path, self.log, self._server_holder, DEFAULT_PORT, PUBLIC_BASE_URL)
             announce_agent(USER_ID, base, self.log)
         except Exception as e:
             self.log(f"❌ Could not start local file server: {e}\n")
@@ -257,16 +336,14 @@ class AgentGUI:
         def work():
             tracks = scan_folder(path, self.log)
             self.log(f"🎵 Found {len(tracks)} valid audio files.\n")
+            _remember_root(path)
 
-            # Remember root (always)
-            st = read_state()
-            st["last_root"] = path
-            write_state(st)
-
-            # Send in batches; first batch clears server if replacing
+            # Send in batches; only the FIRST batch includes replace=True when requested
             send_in_batches(USER_ID, tracks, self.log, batch_size=500, replace=replacing)
+            self.status_var.set("Status: connected (scanned)")
 
         threading.Thread(target=work, daemon=True).start()
+
 
 # ---------- headless ----------
 def run_headless():

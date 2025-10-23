@@ -1,18 +1,45 @@
 # local_file_server.py
 import os, threading, socket, subprocess
-from http.server import SimpleHTTPRequestHandler
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 from urllib.parse import quote
+import shutil
 
 class _QuietHandler(SimpleHTTPRequestHandler):
+    # Silence default logging
     def log_message(self, format, *args):
         pass
 
-class _RootedTCPServer(TCPServer):
+    # Tolerate clients that seek/stop and close the socket mid-transfer
+    def do_GET(self):
+        try:
+            return super().do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            # Client went away—ignore
+            return
+
+    # Chunked copy with disconnect tolerance
+    def copyfile(self, source, outputfile):
+        try:
+            shutil.copyfileobj(source, outputfile, length=64 * 1024)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    # Final write/flush can raise on disconnect—ignore
+    def finish(self):
+        try:
+            super().finish()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+class _RootedThreadingHTTPServer(ThreadingHTTPServer):
+    # Reuse sockets so restarts don’t “stick”
     allow_reuse_address = True
+    daemon_threads = True
 
 def _lan_ip_fallback() -> str:
     ip = "127.0.0.1"
+    s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -20,13 +47,19 @@ def _lan_ip_fallback() -> str:
     except Exception:
         pass
     finally:
-        try: s.close()
-        except Exception: pass
+        try:
+            if s:
+                s.close()
+        except Exception:
+            pass
     return ip
 
 def _tailscale_ip() -> str | None:
     try:
-        out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, check=True, timeout=2).stdout
+        out = subprocess.run(
+            ["tailscale", "ip", "-4"],
+            capture_output=True, text=True, check=True, timeout=2
+        ).stdout
         for line in out.strip().splitlines():
             ip = line.strip()
             if ip.startswith("100."):
@@ -37,12 +70,17 @@ def _tailscale_ip() -> str | None:
 
 def _tailscale_iface_ip() -> str | None:
     try:
-        import fcntl, struct
+        import fcntl, struct  # Linux only
         iface = "tailscale0"
         if not os.path.exists(f"/sys/class/net/{iface}"):
             return None
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        return socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack('256s', iface[:15].encode()))[20:24])
+        try:
+            return socket.inet_ntoa(
+                fcntl.ioctl(s.fileno(), 0x8915, struct.pack('256s', iface[:15].encode()))[20:24]
+            )
+        finally:
+            s.close()
     except Exception:
         return None
 
@@ -64,7 +102,7 @@ class LocalFileServer:
 
     def _choose_ip(self) -> str:
         if self.public_base_url:
-            return self.public_base_url  # already a full base URL
+            return self.public_base_url  # full base URL already
         if not self._chosen_ip:
             self._chosen_ip = _tailscale_ip() or _tailscale_iface_ip() or _lan_ip_fallback()
         return f"http://{self._chosen_ip}:{self.port}"
@@ -81,10 +119,12 @@ class LocalFileServer:
         if not os.path.isdir(self.root_dir):
             raise RuntimeError(f"LocalFileServer root does not exist: {self.root_dir}")
         handler = lambda *a, **k: _QuietHandler(*a, directory=self.root_dir, **k)
-        self._httpd = _RootedTCPServer(("0.0.0.0", self.port), handler)
+        self._httpd = _RootedThreadingHTTPServer(("0.0.0.0", self.port), handler)
         def run():
-            try: self._httpd.serve_forever()
-            except Exception: pass
+            try:
+                self._httpd.serve_forever(poll_interval=0.5)
+            except Exception:
+                pass
         self._thread = threading.Thread(target=run, daemon=True)
         self._thread.start()
 
@@ -93,6 +133,8 @@ class LocalFileServer:
             if self._httpd:
                 self._httpd.shutdown()
                 self._httpd.server_close()
+        except Exception:
+            pass
         finally:
             self._httpd = None
             self._thread = None
