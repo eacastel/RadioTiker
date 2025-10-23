@@ -34,6 +34,7 @@ class ScanPayload(BaseModel):
     user_id: str
     library: List[Track]
     library_version: Optional[int] = None
+    replace: Optional[bool] = False
 
 class AnnouncePayload(BaseModel):
     user_id: str
@@ -112,22 +113,24 @@ def agent_announce(payload: AnnouncePayload):
 @app.post("/api/submit-scan")
 def submit_scan(payload: ScanPayload):
     lib = load_lib(payload.user_id)
+    if payload.replace:
+        lib["tracks"] = {}  
     tracks = lib["tracks"]
+
+     # NEW: honor optional replace flag (clear once on the first batch)
+    try:
+        body = payload.model_dump()
+        if body.get("replace"):
+            tracks.clear()
+    except Exception:
+        pass
 
     for t in payload.library:
         d = t.model_dump()
-        # migrate legacy stream_url -> rel_path (one-time)
-        if not d.get("rel_path") and d.get("path"):
-            # last-scan agent sent absolute paths; keep rel in agent now
-            # if a past submit stored stream_url, try to recover rel from it
-            pass
-        # also handle if some old client sent stream_url, derive rel_path
-        if not d.get("rel_path") and d.get("stream_url"):
-            p = urlparse(d["stream_url"])
-            d["rel_path"] = unquote(p.path.lstrip("/"))
-        d.pop("stream_url", None)
+        # migrate stream_url->rel_path if you still support it
         tracks[d["track_id"]] = d
 
+    # Keep a consistent version for the whole upload session
     lib["version"] = payload.library_version or int(time.time())
     save_lib(payload.user_id, lib)
 
@@ -138,11 +141,14 @@ def submit_scan(payload: ScanPayload):
 
     st = load_agent(payload.user_id)
     return {
-        "ok": True, "user_id": payload.user_id,
-        "count": len(tracks), "version": lib["version"],
+        "ok": True,
+        "user_id": payload.user_id,
+        "count": len(tracks),
+        "version": lib["version"],
         "agent_base_url": st.get("base_url"),
         "preview": preview
     }
+
 
 @app.get("/api/library/{user_id}")
 def get_library(user_id: str):
@@ -195,30 +201,36 @@ def player(user_id: str):
     for t in lib["tracks"].values():
         title = t.get("title") or "Unknown Title"
         artist = t.get("artist") or "Unknown Artist"
-        ok = "✅" if t.get("rel_path") else "—"
+        mark = "✅" if t.get("rel_path") else "—"
         rows.append(f"""
           <tr>
             <td>{title}</td>
             <td>{artist}</td>
-            <td style="text-align:center">{ok}</td>
+            <td style="text-align:center">{mark}</td>
             <td><button onclick="playId('{t['track_id']}')">Play</button></td>
           </tr>
         """)
     rows_html = "\n".join(rows) or "<tr><td colspan='4'>No tracks yet.</td></tr>"
 
-    # NOTE: public path uses /streamer/api/... (nginx adds /api/ upstream)
+    # Note every { and } in CSS/JS is doubled {{ }}, and JS template literals use ${{...}}
     html = f"""<!doctype html>
 <html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>RadioTiker – {user_id}</title>
 <style>
- body{{font-family:system-ui,Segoe UI,Roboto,Arial;padding:24px}}
- table{{width:100%;border-collapse:collapse;margin-top:12px}}
- th,td{{border-bottom:1px solid #eee;padding:8px;text-align:left}}
- thead th{{background:#fafafa}}
+ body{{{{font-family:system-ui,Segoe UI,Roboto,Arial;padding:24px}}}}
+ table{{{{width:100%;border-collapse:collapse;margin-top:12px}}}}
+ th,td{{{{border-bottom:1px solid #eee;padding:8px;text-align:left}}}}
+ thead th{{{{background:#fafafa}}}}
+ .controls{{{{margin:10px 0;display:flex;gap:12px;align-items:center}}}}
 </style></head>
 <body>
 <h1>RadioTiker – Player</h1>
 <p>User: <b>{user_id}</b> &middot; Library version: <b>{lib['version']}</b></p>
+
+<div class="controls">
+  <label><input type="checkbox" id="autoplay" checked> Autoplay next</label>
+  <label><input type="checkbox" id="shuffle"> Shuffle</label>
+</div>
 
 <audio id="player" controls preload="none" style="width:100%">
   <source id="src" src="" type="audio/mpeg"/>
@@ -231,10 +243,14 @@ def player(user_id: str):
 </table>
 
 <script>
+function libver() {{ return Math.floor(Date.now()/1000); }}
 const userId = "{user_id}";
-function cacheBust() {{ return Math.floor(Date.now()/1000); }}
+
+let order = Array.from(document.querySelectorAll('tbody tr')).map((_, i) => i);
+let current = -1;
+
 function playId(tid) {{
-  const url = `/streamer/api/relay/${{userId}}/${{tid}}?v=${{cacheBust()}}`;
+  const url = `/streamer/api/relay/${{userId}}/${{tid}}?v=${{libver()}}`;
   const audio = document.getElementById('player');
   const src = document.getElementById('src');
   src.src = url;
@@ -242,6 +258,33 @@ function playId(tid) {{
   audio.play().catch(()=>{{}});
   document.getElementById('now').innerText = tid;
 }}
+
+function trackIdAtRow(i) {{
+  const btn = document.querySelectorAll('tbody tr')[i]?.querySelector('button');
+  if (!btn) return null;
+  const m = btn.getAttribute('onclick').match(/playId\\('([^']+)'\\)/);
+  return m ? m[1] : null;
+}}
+
+function pickNext() {{
+  const shuffle = document.getElementById('shuffle').checked;
+  if (shuffle) {{
+    return Math.floor(Math.random() * order.length);
+  }} else {{
+    return (current + 1) % order.length;
+  }}
+}}
+
+function playNext() {{
+  current = pickNext();
+  const tid = trackIdAtRow(order[current]);
+  if (tid) playId(tid);
+}}
+
+document.getElementById('player').addEventListener('ended', () => {{
+  const autoplay = document.getElementById('autoplay').checked;
+  if (autoplay) playNext();
+}});
 </script>
 </body></html>"""
     return HTMLResponse(html, status_code=200)
