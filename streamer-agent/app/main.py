@@ -223,35 +223,42 @@ def player(user_id: str):
         title  = t.get("title") or "Unknown Title"
         artist = t.get("artist") or "Unknown Artist"
         album  = t.get("album") or ""
-        mark   = "✅" if t.get("rel_path") else "—"
+        ok     = 1 if t.get("rel_path") else 0
+        mark   = "✅" if ok else "—"
         rows.append(f"""
-          <tr data-tid="{tid}" data-title="{title}" data-artist="{artist}" data-album="{album}">
+          <tr data-tid="{tid}" data-title="{title}" data-artist="{artist}" data-album="{album}" data-ok="{ok}">
             <td>{title}</td>
             <td>{artist}</td>
+            <td>{album}</td>
             <td style="text-align:center">{mark}</td>
             <td><button onclick="playId('{tid}')">Play</button></td>
           </tr>
         """)
-    rows_html = "\n".join(rows) or "<tr><td colspan='4'>No tracks yet.</td></tr>"
+    rows_html = "\n".join(rows) or "<tr><td colspan='5'>No tracks yet.</td></tr>"
 
     html = f"""<!doctype html>
-<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>RadioTiker – {user_id}</title>
 <style>
- body{{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0}}
- .playerbar{{position:sticky;top:0;z-index:10;background:#fff;border-bottom:1px solid #eee;padding:12px}}
- .row{{display:flex;gap:12px;align-items:center;flex-wrap:wrap}}
- .pill{{border:1px solid #ddd;border-radius:999px;padding:4px 10px}}
- .btn{{padding:6px 10px;border-radius:6px;border:1px solid #ddd;background:#fafafa;cursor:pointer}}
- .btn:hover{{filter:brightness(1.03)}}
- .danger{{background:#b91c1c;color:#fff;border:none}}
- .dot{{width:10px;height:10px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:6px;background:#bbb}}
- .dot.ok{{background:#16a34a}}
- table{{width:100%;border-collapse:collapse;margin-top:12px}}
- th,td{{border-bottom:1px solid #eee;padding:8px;text-align:left}}
- thead th{{background:#fafafa}}
- main{{padding:16px 24px 40px}}
-</style></head>
+  body{{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0}}
+  .playerbar{{position:sticky;top:0;z-index:10;background:#fff;border-bottom:1px solid #eee;padding:12px}}
+  .row{{display:flex;gap:12px;align-items:center;flex-wrap:wrap}}
+  .pill{{border:1px solid #ddd;border-radius:999px;padding:4px 10px}}
+  .btn{{padding:6px 10px;border-radius:6px;border:1px solid #ddd;background:#fafafa;cursor:pointer}}
+  .btn:hover{{filter:brightness(1.03)}}
+  .danger{{background:#b91c1c;color:#fff;border:none}}
+  .dot{{width:10px;height:10px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:6px;background:#bbb}}
+  .dot.ok{{background:#16a34a}}
+  table{{width:100%;border-collapse:collapse;margin-top:12px}}
+  th,td{{border-bottom:1px solid #eee;padding:8px;text-align:left}}
+  thead th{{background:#fafafa}}
+  th .arrow{{opacity:.6;margin-left:6px}}
+  main{{padding:16px 24px 40px}}
+</style>
+</head>
 <body>
 
 <div class="playerbar">
@@ -275,47 +282,110 @@ def player(user_id: str):
 <main>
   <p>User: <b>{user_id}</b> · Library version: <b>{lib['version']}</b></p>
   <table>
-    <thead><tr><th>Title</th><th>Artist</th><th>OK?</th><th>Action</th></tr></thead>
+    <thead>
+      <tr>
+        <th onclick="sortBy('title')"  style="cursor:pointer">Title  <span id="ar-title"  class="arrow"></span></th>
+        <th onclick="sortBy('artist')" style="cursor:pointer">Artist <span id="ar-artist" class="arrow"></span></th>
+        <th onclick="sortBy('album')"  style="cursor:pointer">Album  <span id="ar-album"  class="arrow"></span></th>
+        <th>OK?</th>
+        <th>Action</th>
+      </tr>
+    </thead>
     <tbody>{rows_html}</tbody>
   </table>
 </main>
 
 <script>
+// NOTE: This whole block lives inside a Python f-string. That’s why braces are doubled ({{ }}) here.
 function libver() {{ return Math.floor(Date.now()/1000); }}
-const userId = "{user_id}";
+const userId = "{user_id}"; // <-- correct single substitution
 
-let order = Array.from(document.querySelectorAll('tbody tr')).map(function(_, i) {{ return i; }});
-let current = -1; // index into 'order'
+// Take a snapshot of current rows so we can sort/re-render reliably
+function snapshotRows() {{
+  const rows = Array.from(document.querySelectorAll('tbody tr'));
+  return rows.map(r => ({{
+    tid:    r.getAttribute('data-tid')    || "",
+    title:  r.getAttribute('data-title')  || "",
+    artist: r.getAttribute('data-artist') || "",
+    album:  r.getAttribute('data-album')  || "",
+    ok:     Number(r.getAttribute('data-ok') || "0") === 1
+  }}));
+}}
+let ROWS = snapshotRows();
+let order = ROWS.map((_, i) => i);
+let current = -1;
 
-function metaFor(tid) {{
-  const row = Array.from(document.querySelectorAll('tbody tr'))
-             .find(function(r) {{ return r.getAttribute('data-tid') === tid; }});
-  if (!row) return {{title:tid, artist:"", album:""}};
-  return {{
-    title: row.getAttribute('data-title') || tid,
-    artist: row.getAttribute('data-artist') || "",
-    album: row.getAttribute('data-album') || ""
-  }};
+// ---------- render helpers ----------
+function rowHtml(t) {{
+  const mark = t.ok ? "✅" : "—";
+  return (
+    "<tr data-tid=\\"" + t.tid + "\\" data-title=\\"" + t.title + "\\" data-artist=\\"" + t.artist + "\\" data-album=\\"" + t.album + "\\" data-ok=\\"" + (t.ok?1:0) + "\\">" +
+      "<td>" + t.title  + "</td>" +
+      "<td>" + t.artist + "</td>" +
+      "<td>" + t.album  + "</td>" +
+      "<td style=\\"text-align:center\\">" + mark + "</td>" +
+      "<td><button onclick=\\"playId('" + t.tid + "')\\">Play</button></td>" +
+    "</tr>"
+  );
+}}
+function renderRows() {{
+  const tbody = document.querySelector('tbody');
+  tbody.innerHTML = order.map(i => rowHtml(ROWS[i])).join('');
 }}
 
+// ---------- sorting ----------
+let sortKey = 'title';
+let sortDir = 1; // 1 asc, -1 desc
+function sortBy(k) {{
+  if (sortKey === k) sortDir = -sortDir; else {{ sortKey = k; sortDir = 1; }}
+  order.sort((i, j) => {{
+    const a = (ROWS[i][sortKey] || "").toLowerCase();
+    const b = (ROWS[j][sortKey] || "").toLowerCase();
+    if (a < b) return -1 * sortDir;
+    if (a > b) return  1 * sortDir;
+    return 0;
+  }});
+  renderRows();
+  updateSortArrows();
+}}
+function updateSortArrows() {{
+  for (const k of ['title','artist','album']) {{
+    const el = document.getElementById('ar-' + k);
+    if (!el) continue;
+    el.textContent = (k === sortKey) ? (sortDir > 0 ? '▲' : '▼') : '';
+  }}
+}}
+// initial arrow
+updateSortArrows();
+
+// ---------- helpers for playing ----------
 function trackIdAtRow(i) {{
   const row = document.querySelectorAll('tbody tr')[i];
   return row ? row.getAttribute('data-tid') : null;
 }}
-
 function rowIndexOfTid(tid) {{
   const rows = Array.from(document.querySelectorAll('tbody tr'));
   for (let i=0;i<rows.length;i++) if (rows[i].getAttribute('data-tid')===tid) return i;
   return -1;
 }}
+function metaFor(tid) {{
+  const row = Array.from(document.querySelectorAll('tbody tr')).find(r => r.getAttribute('data-tid') === tid);
+  if (!row) return {{title:tid, artist:"", album:""}};
+  return {{
+    title:  row.getAttribute('data-title')  || tid,
+    artist: row.getAttribute('data-artist') || "",
+    album:  row.getAttribute('data-album')  || ""
+  }};
+}}
 
+// ---------- playback ----------
 function playId(tid) {{
   const url = "/streamer/api/relay/" + userId + "/" + tid + "?v=" + libver();
   const audio = document.getElementById('player');
   const src = document.getElementById('src');
   src.src = url;
   audio.load();
-  audio.play().catch(function(){{}});
+  audio.play().catch(() => {{}});
 
   const m = metaFor(tid);
   const albumText = m.album ? " (" + m.album + ")" : "";
@@ -327,29 +397,21 @@ function playId(tid) {{
     if (pos >= 0) current = pos;
   }}
 }}
-
 function pickNextIndex() {{
   const shuffle = document.getElementById('shuffle').checked;
   if (order.length === 0) return -1;
-  if (shuffle) {{
-    return Math.floor(Math.random() * order.length);
-  }} else {{
-    return (current + 1) % order.length;
-  }}
+  return shuffle ? Math.floor(Math.random() * order.length) : (current + 1) % order.length;
 }}
-
 function pickPrevIndex() {{
   if (order.length === 0) return -1;
   return (current - 1 + order.length) % order.length;
 }}
-
 function playNext() {{
   if (order.length === 0) return;
   current = pickNextIndex();
   const tid = trackIdAtRow(order[current]);
   if (tid) playId(tid);
 }}
-
 function playPrev() {{
   if (order.length === 0) return;
   current = pickPrevIndex();
@@ -357,16 +419,33 @@ function playPrev() {{
   if (tid) playId(tid);
 }}
 
-document.getElementById('player').addEventListener('ended', function() {{
+// Allow native ▶️ to kick off if nothing is selected yet
+(function() {{
+  const audio = document.getElementById('player');
+  function kick() {{
+    if (!audio.currentSrc || audio.currentSrc === "" || audio.currentSrc === window.location.href) {{
+      if (current >= 0) {{
+        const tid = trackIdAtRow(order[current]);
+        if (tid) playId(tid);
+      }} else {{
+        playNext();
+      }}
+      setTimeout(() => audio.play().catch(() => {{}}), 0);
+    }}
+  }}
+  audio.addEventListener('play', kick);
+}})();
+
+// Autoplay next on end
+document.getElementById('player').addEventListener('ended', () => {{
   const autoplay = document.getElementById('autoplay').checked;
   if (autoplay) playNext();
 }});
 
-// Agent status dot
+// Agent status dot (online if last_seen < 120s)
 async function refreshStatus() {{
   try {{
     const res = await fetch("/streamer/api/agent/" + userId + "/status");
-    if (!res.ok) throw new Error(await res.text());
     const j = await res.json();
     const dot = document.getElementById('stDot');
     if (j.online) dot.classList.add('ok'); else dot.classList.remove('ok');
@@ -376,7 +455,6 @@ async function refreshStatus() {{
 }}
 refreshStatus();
 setInterval(refreshStatus, 10000);
-
 
 // Clear library
 async function confirmClear() {{
@@ -390,7 +468,8 @@ async function confirmClear() {{
   }}
 }}
 </script>
-</body></html>"""
+</body>
+</html>"""
     return HTMLResponse(html, status_code=200)
 
 
@@ -408,17 +487,20 @@ def radio_page(user_id: str):
     tracks_json = json.dumps(tracks)
 
     html = f"""<!doctype html>
-<html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<html>
+<head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>{user_id} — Radio</title>
 <style>
- body{{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;padding:20px}}
- .bar{{max-width:900px;margin:0 auto}}
- .dot{{width:10px;height:10px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:6px;background:#bbb}}
- .dot.ok{{background:#16a34a}}
- .row{{display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
- .now{{margin-top:10px}}
- .hint{{color:#666;font-size:14px;margin-top:6px}}
-</style></head>
+  body{{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;padding:20px}}
+  .bar{{max-width:900px;margin:0 auto}}
+  .dot{{width:10px;height:10px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:6px;background:#bbb}}
+  .dot.ok{{background:#16a34a}}
+  .row{{display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
+  .now{{margin-top:10px}}
+  .hint{{color:#666;font-size:14px;margin-top:6px}}
+</style>
+</head>
 <body>
 <div class="bar">
   <div class="row">
@@ -435,54 +517,44 @@ def radio_page(user_id: str):
 </div>
 
 <script>
+function libver() {{ return Math.floor(Date.now()/1000); }}
 const userId = "{user_id}";
 const TRACKS = {tracks_json};
 
-function libver() {{ return Math.floor(Date.now()/1000); }}
-
 function pickIndex() {{
   if (TRACKS.length === 0) return -1;
-  return Math.floor(Math.random() * TRACKS.length); // shuffle by default
+  return Math.floor(Math.random() * TRACKS.length);
 }}
-
 function playIndex(i) {{
-  const m = TRACKS[i];
-  if (!m) return;
+  const m = TRACKS[i]; if (!m) return;
   const url = "/streamer/api/relay/" + userId + "/" + m.track_id + "?v=" + libver();
   const audio = document.getElementById('player');
   const src = document.getElementById('src');
   src.src = url;
   audio.load();
-  audio.play().catch(function(){{}});
+  audio.play().catch(() => {{}});
+
   const albumText = m.album ? " (" + m.album + ")" : "";
   document.getElementById('now').innerText = m.artist + " — " + m.title + albumText;
 }}
-
 let current = -1;
-function playNext() {{
-  current = pickIndex();
-  if (current >= 0) playIndex(current);
-}}
+function playNext() {{ current = pickIndex(); if (current >= 0) playIndex(current); }}
 
-// 1) If user hits ▶️ with no source yet, kick off playback, then keep native controls.
+// Native ▶️ kick
 const audio = document.getElementById('player');
 function firstPlayKick() {{
   if (!audio.currentSrc || audio.currentSrc === "" || audio.currentSrc === window.location.href) {{
     playNext();
-    // Try again after setting the src (some browsers need a 0-tick delay)
-    setTimeout(function(){{ audio.play().catch(function(){{}}); }}, 0);
+    setTimeout(() => audio.play().catch(() => {{}}), 0);
   }}
 }}
-audio.addEventListener('play', firstPlayKick, {{ once:false }});
+audio.addEventListener('play', firstPlayKick);
+audio.addEventListener('ended', () => playNext());
 
-// 2) Keep going when a track ends
-audio.addEventListener('ended', function() {{ playNext(); }});
-
-// 3) Agent status dot
+// Agent status
 async function refreshStatus() {{
   try {{
     const res = await fetch("/streamer/api/agent/" + userId + "/status");
-    if (!res.ok) throw new Error(await res.text());
     const j = await res.json();
     const dot = document.getElementById('stDot');
     if (j.online) dot.classList.add('ok'); else dot.classList.remove('ok');
@@ -493,6 +565,6 @@ async function refreshStatus() {{
 refreshStatus();
 setInterval(refreshStatus, 10000);
 </script>
-</body></html>"""
+</body>
+</html>"""
     return HTMLResponse(html, status_code=200)
-
