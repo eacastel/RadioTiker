@@ -1,10 +1,10 @@
 # app/main.py
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
-from urllib.parse import urlparse, unquote
+from urllib.parse import quote, unquote
 import json, time, requests
 
 app = FastAPI(title="RadioTiker Streamer API")
@@ -15,8 +15,10 @@ DATA_DIR = ROOT / "data" / "user-libraries"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # === state ===
-LIBS: Dict[str, Dict[str, Any]] = {}    # user_id -> {"tracks": {track_id: track}, "version": int}
-AGENTS: Dict[str, Dict[str, Any]] = {}  # user_id -> {"base_url": str, "last_seen": int}
+# LIBS[user] -> {"tracks": {track_id: track_dict}, "version": int, "_cleared_for": int}
+# AGENTS[user] -> {"base_url": str, "last_seen": int}
+LIBS: Dict[str, Dict[str, Any]] = {}
+AGENTS: Dict[str, Dict[str, Any]] = {}
 
 # -------- models --------
 class Track(BaseModel):
@@ -62,7 +64,7 @@ def load_lib(user_id: str) -> Dict[str, Any]:
                 return obj
         except Exception:
             pass
-    LIBS[user_id] = {"tracks": {}, "version": int(time.time())}
+    LIBS[user_id] = {"tracks": {}, "version": int(time.time()), "_cleared_for": 0}
     return LIBS[user_id]
 
 def save_lib(user_id: str, lib: Dict[str, Any]):
@@ -73,31 +75,74 @@ def load_agent(user_id: str) -> Dict[str, Any]:
     if user_id in AGENTS:
         return AGENTS[user_id]
     p = agent_path(user_id)
+    st: Dict[str, Any] = {}
     if p.exists():
         try:
-            AGENTS[user_id] = json.loads(p.read_text())
-            return AGENTS[user_id]
+            # file only contains stable keys (e.g., base_url)
+            st = json.loads(p.read_text())
         except Exception:
-            pass
-    AGENTS[user_id] = {}
-    return AGENTS[user_id]
-
-def save_agent(user_id: str, st: Dict[str, Any]):
+            st = {}
+    st.setdefault("last_seen", 0)  # volatile default (in-memory only)
     AGENTS[user_id] = st
-    agent_path(user_id).write_text(json.dumps(st, indent=2))
+    return st
+
+def save_agent_stable(user_id: str, st: Dict[str, Any]):
+    """Persist only stable fields (like base_url). Do not persist last_seen."""
+    stable = {"base_url": st.get("base_url")}
+    AGENTS[user_id] = {**st}  # keep full state in memory
+    agent_path(user_id).write_text(json.dumps(stable, indent=2))
+
+def normalize_rel_path(rel: str) -> str:
+    """Normalize rel_path: ensure exactly one level of URL-encoding per segment."""
+    rel = rel.lstrip("/")
+    segs = [quote(unquote(s), safe="@!$&'()*+,;=:_-.") for s in rel.split("/")]
+    return "/".join(segs)
 
 def build_stream_url(user_id: str, t: Dict[str, Any]) -> Optional[str]:
-    """Rebuild the file URL using the agent's current base_url + stored rel_path."""
+    """Rebuild file URL using agent's base_url + stored rel_path (no re-encode here)."""
     st = load_agent(user_id)
     base = st.get("base_url")
-    rel = t.get("rel_path")
+    rel  = t.get("rel_path")
     if not base or not rel:
         return None
-    # client already URL-encodes path segments; send as-is
     return f"{base.rstrip('/')}/{rel.lstrip('/')}"
 
-# -------- endpoints (all under /api/*) --------
+# -------- debug --------
+@app.get("/api/debug/peek/{user_id}/{track_id}")
+def debug_peek(user_id: str, track_id: str):
+    """
+    Show the exact upstream URL and the result of a HEAD request.
+    """
+    lib = load_lib(user_id)
+    t = lib["tracks"].get(track_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Unknown track_id")
 
+    built = build_stream_url(user_id, t)
+    if not built:
+        return {
+            "ok": False,
+            "reason": "no_base_or_rel_path",
+            "agent_state": load_agent(user_id),
+            "track_rel_path": t.get("rel_path"),
+        }
+
+    result = {"ok": True, "url": built}
+    try:
+        r = requests.head(built, timeout=(5, 15), allow_redirects=True,
+                          headers={"User-Agent": "RadioTiker-Relay/peek"})
+        result.update({
+            "head_status": r.status_code,
+            "head_headers": dict(r.headers),
+        })
+    except Exception as e:
+        result.update({
+            "head_status": None,
+            "error": f"{type(e).__name__}: {e}",
+        })
+    return result
+
+# -------- endpoints (all under /api/*) --------
 @app.get("/api/health")
 def health():
     return {"ok": True}
@@ -107,45 +152,80 @@ def clear_library(user_id: str):
     lib = load_lib(user_id)
     lib["tracks"] = {}
     lib["version"] = int(time.time())
+    lib["_cleared_for"] = 0
     save_lib(user_id, lib)
     return {"ok": True, "cleared": True, "version": lib["version"]}
 
+@app.post("/api/library/{user_id}/migrate-relpaths")
+def migrate_relpaths(user_id: str):
+    """One-time normalization of existing rel_path values in the saved library."""
+    lib = load_lib(user_id)
+    tracks = lib.get("tracks", {})
+    changed = 0
+    for _, v in tracks.items():
+        rel = v.get("rel_path")
+        if not rel:
+            continue
+        new_rel = normalize_rel_path(rel)
+        if new_rel != rel:
+            v["rel_path"] = new_rel
+            changed += 1
+    if changed:
+        lib["version"] = int(time.time())
+        save_lib(user_id, lib)
+    return {"ok": True, "changed": changed, "count": len(tracks), "version": lib["version"]}
+
 @app.post("/api/agent/announce")
 def agent_announce(payload: AnnouncePayload):
+    """
+    Persist only when base_url changes; update last_seen in memory every call.
+    """
     st = load_agent(payload.user_id)
-    st["base_url"] = payload.base_url.rstrip("/")
+    new_base = payload.base_url.rstrip("/")
+    changed = (st.get("base_url") != new_base)
+
+    st["base_url"] = new_base
     st["last_seen"] = int(time.time())
-    save_agent(payload.user_id, st)
-    return {"ok": True, "base_url": st["base_url"]}
+    AGENTS[payload.user_id] = st  # in-memory heartbeat
+
+    if changed:
+        save_agent_stable(payload.user_id, st)
+
+    return {"ok": True, "base_url": st["base_url"], "persisted": changed}
 
 @app.post("/api/submit-scan")
 def submit_scan(payload: ScanPayload):
+    """
+    Idempotent replace:
+      - If replace=True AND we haven't cleared for this library_version, clear once and remember it.
+      - Normalize rel_path for every incoming track.
+    """
     lib = load_lib(payload.user_id)
-    if payload.replace:
-        lib["tracks"] = {}  
     tracks = lib["tracks"]
 
-     # NEW: honor optional replace flag (clear once on the first batch)
-    try:
-        body = payload.model_dump()
-        if body.get("replace"):
-            tracks.clear()
-    except Exception:
-        pass
+    # One-time clear per version when replace=True
+    session_ver = int(payload.library_version or int(time.time()))
+    if payload.replace and lib.get("_cleared_for") != session_ver:
+        tracks.clear()
+        lib["_cleared_for"] = session_ver
 
+    # Upsert tracks from batch with normalized rel_path
     for t in payload.library:
         d = t.model_dump()
-        # migrate stream_url->rel_path if you still support it
+        if d.get("rel_path"):
+            d["rel_path"] = normalize_rel_path(d["rel_path"])
         tracks[d["track_id"]] = d
 
-    # Keep a consistent version for the whole upload session
-    lib["version"] = payload.library_version or int(time.time())
+    # Keep a consistent version (the session’s version wins)
+    lib["version"] = session_ver
     save_lib(payload.user_id, lib)
 
+    # Tiny preview for sanity
     preview = []
     for i, (_, v) in enumerate(tracks.items()):
-        if i >= 3: break
-        preview.append({k: v.get(k) for k in ("title", "artist", "track_id", "rel_path")})
+        if i >= 3:
+            break
+        preview.append({k: v.get(k) for k in ("title", "artist", "album", "track_id", "rel_path")})
 
     st = load_agent(payload.user_id)
     return {
@@ -169,13 +249,12 @@ def agent_status(user_id: str):
         "last_seen": last_seen,
     }
 
-
 @app.get("/api/library/{user_id}")
 def get_library(user_id: str):
     lib = load_lib(user_id)
     return {"version": lib["version"], "tracks": list(lib["tracks"].values())}
 
-@app.get("/api/relay/{user_id}/{track_id}")
+@app.api_route("/api/relay/{user_id}/{track_id}", methods=["GET", "HEAD"])
 def relay(user_id: str, track_id: str, request: Request):
     lib = load_lib(user_id)
     track = lib["tracks"].get(track_id)
@@ -186,43 +265,102 @@ def relay(user_id: str, track_id: str, request: Request):
     if not url:
         raise HTTPException(status_code=503, detail="Agent offline or base_url/rel_path unknown")
 
-    headers = {"User-Agent": "RadioTiker-Relay/0.3"}
-    rng = request.headers.get("range")
-    if rng:
-        headers["Range"] = rng
+    client_range = request.headers.get("range")
+    base_headers = {"User-Agent": "RadioTiker-Relay/0.3"}
 
+    # --- Probe upstream range capability (quick HEAD) ---
+    upstream_accepts_ranges = False
     try:
-        upstream = requests.get(url, stream=True, timeout=(5, 30), headers=headers)
-        upstream.raise_for_status()
+        probe_h = dict(base_headers); probe_h["Range"] = "bytes=0-0"
+        probe = requests.head(url, timeout=(5, 10), headers=probe_h, allow_redirects=True)
+        if probe.status_code == 206 or \
+           probe.headers.get("Accept-Ranges", "").lower() == "bytes" or \
+           probe.headers.get("Content-Range"):
+            upstream_accepts_ranges = True
     except requests.RequestException as e:
+        print(f"[relay] probe failed user={user_id} track={track_id} url={url} err={e}")
+
+    # --- Decide Range we send upstream ---
+    headers = dict(base_headers)
+    if request.method == "GET":
+        if client_range:
+            headers["Range"] = client_range                         # honor client seek
+        elif upstream_accepts_ranges:
+            headers["Range"] = "bytes=0-"                           # coax 206 for playback
+    else:  # HEAD
+        if client_range:
+            headers["Range"] = client_range
+        elif upstream_accepts_ranges:
+            headers["Range"] = "bytes=0-0"
+
+    # --- Fetch upstream ---
+    try:
+        upstream = (
+            requests.head(url, timeout=(5, 15), headers=headers, allow_redirects=True)
+            if request.method == "HEAD"
+            else requests.get(url, stream=True, timeout=(5, 300), headers=headers)
+        )
+    except requests.RequestException as e:
+        print(f"[relay] upstream error user={user_id} track={track_id} url={url} err={e}")
         raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
 
-    passthrough = {}
+    status = upstream.status_code
+    if status >= 400:
+        body_preview = None
+        try:
+            body_preview = upstream.text[:400]
+        except Exception:
+            pass
+        print(f"[relay] upstream HTTP {status} user={user_id} track={track_id} url={url} body={body_preview!r}")
+        raise HTTPException(status_code=status, detail=f"Upstream returned {status}")
+
+    # --- Build response headers ---
+    passthrough: Dict[str, str] = {}
     for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control", "ETag", "Last-Modified"]:
         v = upstream.headers.get(k)
         if v:
             passthrough[k] = v
-    # ensure fresh after rescans
+
+    # Always advertise byte serving to the browser
+    passthrough.setdefault("Accept-Ranges", "bytes")
+    # Ensure fresh after rescans
     passthrough.setdefault("Cache-Control", "no-store")
+
+    # If a range was requested (by client or by us) but upstream replied 200 without Content-Range,
+    # synthesize a proper 206 with a full-range Content-Range header.
+    requested_range = ("Range" in headers) or (client_range is not None)
+    total_len = upstream.headers.get("Content-Length")
+    if requested_range and status == 200 and total_len and not passthrough.get("Content-Range"):
+        try:
+            total = int(total_len)
+            passthrough["Content-Range"] = f"bytes 0-{total-1}/{total}"
+            status = 206
+        except Exception:
+            pass  # leave as-is
+
+    media = upstream.headers.get("Content-Type") or "audio/mpeg"
+
+    if request.method == "HEAD":
+        return Response(status_code=status, headers=passthrough, media_type=media)
 
     def gen():
         for chunk in upstream.iter_content(chunk_size=64 * 1024):
             if chunk:
                 yield chunk
 
-    status = upstream.status_code  # 200 or 206
-    media = upstream.headers.get("Content-Type") or "audio/mpeg"
     return StreamingResponse(gen(), media_type=media, headers=passthrough, status_code=status)
 
+
+# ---------------- UI: full player ----------------
 @app.get("/api/user/{user_id}/play", response_class=HTMLResponse)
 def player(user_id: str):
     lib = load_lib(user_id)
     rows = []
     for t in lib["tracks"].values():
         tid    = t.get("track_id")
-        title  = t.get("title") or "Unknown Title"
+        title  = t.get("title")  or "Unknown Title"
         artist = t.get("artist") or "Unknown Artist"
-        album  = t.get("album") or ""
+        album  = t.get("album")  or ""
         ok     = 1 if t.get("rel_path") else 0
         mark   = "✅" if ok else "—"
         rows.append(f"""
@@ -254,7 +392,7 @@ def player(user_id: str):
   .dot.ok{{background:#16a34a}}
   table{{width:100%;border-collapse:collapse;margin-top:12px}}
   th,td{{border-bottom:1px solid #eee;padding:8px;text-align:left}}
-  thead th{{background:#fafafa}}
+  thead th{{position: sticky; top: 0; z-index: 1; background: #fafafa}}
   th .arrow{{opacity:.6;margin-left:6px}}
   main{{padding:16px 24px 40px}}
 </style>
@@ -272,9 +410,16 @@ def player(user_id: str):
     <button class="btn danger" onclick="confirmClear()">Clear library</button>
   </div>
   <div class="row" style="margin-top:8px">
-    <audio id="player" controls preload="none" style="width:100%">
-      <source id="src" src="" type="audio/mpeg"/>
-    </audio>
+    <!-- Visible player -->
+    <audio id="player" controls preload="none" style="width:100%"></audio>
+    <!-- Hidden helper for crossfade -->
+    <audio id="player2" preload="auto" style="display:none"></audio>
+  </div>
+  <div class="row" style="gap:16px;margin-top:6px">
+    <label class="pill"><input type="checkbox" id="xfade"> Crossfade</label>
+    <label class="pill" title="Seconds to crossfade">
+      Fade (s): <input id="xfadeSecs" type="number" min="0" max="10" value="3" style="width:56px;margin-left:6px">
+    </label>
   </div>
   <div style="margin-top:6px"><b>Now Playing:</b> <span id="now">—</span></div>
 </div>
@@ -296,11 +441,13 @@ def player(user_id: str):
 </main>
 
 <script>
-// NOTE: This whole block lives inside a Python f-string. That’s why braces are doubled ({{ }}) here.
-function libver() {{ return Math.floor(Date.now()/1000); }}
-const userId = "{user_id}"; // <-- correct single substitution
+// NOTE: This block is inside a Python f-string. JS braces are doubled {{ }}.
 
-// Take a snapshot of current rows so we can sort/re-render reliably
+function libver() {{ return Math.floor(Date.now()/1000); }}
+const userId = "{user_id}";
+const API = (window.location.pathname.startsWith("/streamer/")) ? "/streamer/api" : "/api";
+
+// ---------- table snapshot for sorting ----------
 function snapshotRows() {{
   const rows = Array.from(document.querySelectorAll('tbody tr'));
   return rows.map(r => ({{
@@ -314,6 +461,7 @@ function snapshotRows() {{
 let ROWS = snapshotRows();
 let order = ROWS.map((_, i) => i);
 let current = -1;
+let lastTid = null;
 
 // ---------- render helpers ----------
 function rowHtml(t) {{
@@ -331,11 +479,17 @@ function rowHtml(t) {{
 function renderRows() {{
   const tbody = document.querySelector('tbody');
   tbody.innerHTML = order.map(i => rowHtml(ROWS[i])).join('');
+  ROWS = snapshotRows();
+  order = ROWS.map((_, i) => i);
+  if (lastTid) {{
+    const ri = rowIndexOfTid(lastTid);
+    if (ri >= 0) current = ri;
+  }}
 }}
 
 // ---------- sorting ----------
 let sortKey = 'title';
-let sortDir = 1; // 1 asc, -1 desc
+let sortDir = 1;
 function sortBy(k) {{
   if (sortKey === k) sortDir = -sortDir; else {{ sortKey = k; sortDir = 1; }}
   order.sort((i, j) => {{
@@ -355,10 +509,9 @@ function updateSortArrows() {{
     el.textContent = (k === sortKey) ? (sortDir > 0 ? '▲' : '▼') : '';
   }}
 }}
-// initial arrow
 updateSortArrows();
 
-// ---------- helpers for playing ----------
+// ---------- helpers for rows/meta ----------
 function trackIdAtRow(i) {{
   const row = document.querySelectorAll('tbody tr')[i];
   return row ? row.getAttribute('data-tid') : null;
@@ -378,74 +531,212 @@ function metaFor(tid) {{
   }};
 }}
 
-// ---------- playback ----------
-function playId(tid) {{
-  const url = "/streamer/api/relay/" + userId + "/" + tid + "?v=" + libver();
-  const audio = document.getElementById('player');
-  const src = document.getElementById('src');
-  src.src = url;
-  audio.load();
-  audio.play().catch(() => {{}});
+// ---------- audio plumbing (with optional crossfade) ----------
+// ---------- audio plumbing (with optional crossfade) ----------
+const a1 = document.getElementById('player');   // visible
+const a2 = document.getElementById('player2');  // hidden helper
 
+// Web Audio (optional, lazy-initialized when Crossfade is enabled)
+let AC = null, g1 = null, g2 = null, n1 = null, n2 = null;
+async function ensureAudioGraph() {{
+  if (AC) return true;
+  try {{
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx || !a1 || !a2) return false;
+    AC = new Ctx();
+    n1 = AC.createMediaElementSource(a1);
+    n2 = AC.createMediaElementSource(a2);
+    g1 = AC.createGain();
+    g2 = AC.createGain();
+    g1.gain.value = 1.0; 
+    g2.gain.value = 0.0;
+    n1.connect(g1).connect(AC.destination);
+    n2.connect(g2).connect(AC.destination);
+    return true;
+  }} catch (e) {{
+    console.warn("[xfade] graph init failed:", e);
+    AC = null; g1 = g2 = n1 = n2 = null;
+    return false;
+  }}
+}}
+
+// If user enables Crossfade, build graph and resume the context
+document.addEventListener('DOMContentLoaded', () => {{
+  const xcb = document.getElementById('xfade');
+  if (!xcb) return;
+  xcb.addEventListener('change', async () => {{
+    if (xcb.checked) {{
+      const ok = await ensureAudioGraph();
+      if (ok) {{
+        try {{ if (AC.state === 'suspended') await AC.resume(); }} catch (e) {{}}
+      }}
+    }}
+  }});
+}});
+
+function setNowPlaying(tid) {{
   const m = metaFor(tid);
   const albumText = m.album ? " (" + m.album + ")" : "";
   document.getElementById('now').innerText = m.artist + " — " + m.title + albumText;
-
-  const ri = rowIndexOfTid(tid);
-  if (ri >= 0) {{
-    const pos = order.indexOf(ri);
-    if (pos >= 0) current = pos;
-  }}
 }}
+
+function urlFor(tid) {{
+  return API + "/relay/" + userId + "/" + tid + "?v=" + libver();
+}}
+
+// Visible element play (no WebAudio required)
+function playId(tid) {{
+  const url = urlFor(tid);
+  a1.src = url;
+  a1.load();
+  a1.play().catch(() => {{}});
+
+  // stop helper if it was in use
+  if (a2) try {{ a2.pause(); }} catch (e) {{}}
+
+  setNowPlaying(tid);
+  const ri = rowIndexOfTid(tid);
+  if (ri >= 0) current = ri;
+  lastTid = tid;
+}}
+
+// Crossfade helper (uses WebAudio only if toggle is ON and graph is available)
+async function xfadeTo(tid) {{
+  const toggle = document.getElementById('xfade');
+  const secsEl = document.getElementById('xfadeSecs');
+  const secs = Math.max(0, Math.min(10, Number(secsEl ? secsEl.value : 0) || 0));
+
+  // Fall back to simple play if crossfade is off, graph not ready, or invalid seconds
+  if (!toggle || !toggle.checked || secs <= 0 || !a2) {{
+    playId(tid);
+    return;
+  }}
+
+  const ok = await ensureAudioGraph();
+  if (!ok || !g1 || !g2) {{
+    playId(tid);
+    return;
+  }}
+
+  try {{ if (AC.state === 'suspended') await AC.resume(); }} catch (e) {{}}
+
+  // Decide which element is currently active
+  const active = (!a1.paused && a1.currentSrc) ? a1 : ((!a2.paused && a2.currentSrc) ? a2 : a1);
+  const helper = (active === a1) ? a2 : a1;
+  const gActive = (active === a1) ? g1 : g2;
+  const gHelper = (helper === a1) ? g1 : g2;
+
+  // Prepare helper with next track
+  helper.src = urlFor(tid);
+  try {{ helper.load(); }} catch (e) {{}}
+  helper.currentTime = 0;
+
+  try {{
+    gHelper.gain.setValueAtTime(0, AC.currentTime);
+    // Start helper; ignore autoplay/gesture errors (user already clicked)
+    helper.play().catch(() => {{}}); 
+  }} catch (e) {{
+    // If anything goes wrong, just do a hard switch
+    playId(tid);
+    return;
+  }}
+
+  // Schedule crossfade
+  const now = AC.currentTime;
+  gActive.gain.cancelScheduledValues(now);
+  gHelper.gain.cancelScheduledValues(now);
+  gActive.gain.setValueAtTime(gActive.gain.value, now);
+  gHelper.gain.setValueAtTime(gHelper.gain.value, now);
+  gActive.gain.linearRampToValueAtTime(0.0, now + secs);
+  gHelper.gain.linearRampToValueAtTime(1.0, now + secs);
+
+  // After fade completes, make helper the visible element source (keep UI consistent)
+  setTimeout(() => {{
+    try {{ active.pause(); }} catch (e) {{}}
+    if (helper !== a1) {{
+      a1.src = helper.src;
+      a1.load();
+      a1.currentTime = helper.currentTime;
+      a1.play().catch(() => {{}});
+
+      // Reset gains for next transition
+      if (g1 && g2) {{ g1.gain.value = 1.0; g2.gain.value = 0.0; }}
+      try {{ helper.pause(); }} catch (e) {{}}
+    }} else {{
+      if (g1 && g2) {{ g1.gain.value = 1.0; g2.gain.value = 0.0; }}
+      try {{ a2.pause(); }} catch (e) {{}}
+    }}
+  }}, Math.ceil((secs + 0.05) * 1000));
+
+  setNowPlaying(tid);
+  const ri = rowIndexOfTid(tid);
+  if (ri >= 0) current = ri;
+  lastTid = tid;
+}}
+
+
+// ---------- queue navigation ----------
 function pickNextIndex() {{
   const shuffle = document.getElementById('shuffle').checked;
-  if (order.length === 0) return -1;
-  return shuffle ? Math.floor(Math.random() * order.length) : (current + 1) % order.length;
+  if (ROWS.length === 0) return -1;
+  return shuffle ? Math.floor(Math.random() * ROWS.length) : (current + 1) % ROWS.length;
 }}
 function pickPrevIndex() {{
-  if (order.length === 0) return -1;
-  return (current - 1 + order.length) % order.length;
+  if (ROWS.length === 0) return -1;
+  return (current - 1 + ROWS.length) % ROWS.length;
 }}
 function playNext() {{
-  if (order.length === 0) return;
-  current = pickNextIndex();
-  const tid = trackIdAtRow(order[current]);
-  if (tid) playId(tid);
+  if (ROWS.length === 0) {{ alert("No tracks found."); return; }}
+  const i = pickNextIndex(); if (i < 0) return;
+  current = i;
+  const tid = trackIdAtRow(current); if (!tid) return;
+  const useX = document.getElementById('xfade') && document.getElementById('xfade').checked;
+  useX ? xfadeTo(tid) : playId(tid);
 }}
 function playPrev() {{
-  if (order.length === 0) return;
-  current = pickPrevIndex();
-  const tid = trackIdAtRow(order[current]);
-  if (tid) playId(tid);
+  if (ROWS.length === 0) {{ alert("No tracks found."); return; }}
+  const i = pickPrevIndex(); if (i < 0) return;
+  current = i;
+  const tid = trackIdAtRow(current); if (!tid) return;
+  const useX = document.getElementById('xfade') && document.getElementById('xfade').checked;
+  useX ? xfadeTo(tid) : playId(tid);
 }}
 
-// Allow native ▶️ to kick off if nothing is selected yet
-(function() {{
-  const audio = document.getElementById('player');
-  function kick() {{
-    if (!audio.currentSrc || audio.currentSrc === "" || audio.currentSrc === window.location.href) {{
-      if (current >= 0) {{
-        const tid = trackIdAtRow(order[current]);
-        if (tid) playId(tid);
-      }} else {{
-        playNext();
+// ---------- make native ▶️ start playback even with no src ----------
+function kickIfEmpty() {{
+  if (!a1.currentSrc || a1.currentSrc === "" || a1.currentSrc === window.location.href) {{
+    if (current >= 0) {{
+      const tid = trackIdAtRow(current);
+      if (tid) {{
+        const useX = document.getElementById('xfade') && document.getElementById('xfade').checked;
+        useX ? xfadeTo(tid) : playId(tid);
       }}
-      setTimeout(() => audio.play().catch(() => {{}}), 0);
+    }} else {{
+      playNext();
     }}
+    setTimeout(() => a1.play().catch(() => {{}}), 0);
   }}
-  audio.addEventListener('play', kick);
-}})();
+}}
+a1.addEventListener('play',  kickIfEmpty);
+a1.addEventListener('click', kickIfEmpty);
+a1.addEventListener('touchstart', kickIfEmpty);
 
-// Autoplay next on end
-document.getElementById('player').addEventListener('ended', () => {{
+// Helpful error surfacing if a stream fails to load
+a1.addEventListener('error', () => {{
+  const src = a1.currentSrc || "(no source)";
+  alert("Audio error. Could not load: " + src);
+}});
+
+// ---------- autoplay next on end ----------
+a1.addEventListener('ended', () => {{
   const autoplay = document.getElementById('autoplay').checked;
   if (autoplay) playNext();
 }});
 
-// Agent status dot (online if last_seen < 120s)
+// ---------- Agent status dot ----------
 async function refreshStatus() {{
   try {{
-    const res = await fetch("/streamer/api/agent/" + userId + "/status");
+    const res = await fetch(API + "/agent/" + userId + "/status");
     const j = await res.json();
     const dot = document.getElementById('stDot');
     if (j.online) dot.classList.add('ok'); else dot.classList.remove('ok');
@@ -456,11 +747,11 @@ async function refreshStatus() {{
 refreshStatus();
 setInterval(refreshStatus, 10000);
 
-// Clear library
+// ---------- Clear library ----------
 async function confirmClear() {{
   if (!confirm("Are you sure you want to CLEAR your library on the server?")) return;
   try {{
-    const res = await fetch("/streamer/api/library/" + userId + "/clear", {{method:'POST'}});
+    const res = await fetch(API + "/library/" + userId + "/clear", {{ method: "POST" }});
     if (!res.ok) throw new Error(await res.text());
     location.reload();
   }} catch (e) {{
@@ -468,11 +759,12 @@ async function confirmClear() {{
   }}
 }}
 </script>
+
 </body>
 </html>"""
     return HTMLResponse(html, status_code=200)
 
-
+# ---------------- UI: tiny radio page ----------------
 @app.get("/api/radio/{user_id}", response_class=HTMLResponse)
 def radio_page(user_id: str):
     lib = load_lib(user_id)
@@ -482,7 +774,7 @@ def radio_page(user_id: str):
             "track_id": t.get("track_id"),
             "title": t.get("title") or "Unknown Title",
             "artist": t.get("artist") or "Unknown Artist",
-            "album": t.get("album") or "",
+            "album":  t.get("album")  or "",
         })
     tracks_json = json.dumps(tracks)
 
@@ -508,32 +800,32 @@ def radio_page(user_id: str):
     <strong>{user_id} — Radio</strong>
   </div>
   <div class="row" style="margin-top:8px">
-    <audio id="player" controls preload="none" style="width:100%">
-      <source id="src" src="" type="audio/mpeg"/>
-    </audio>
+    <audio id="player" controls preload="none" style="width:100%"></audio>
   </div>
   <div class="now"><b>Now Playing:</b> <span id="now">—</span></div>
   <div class="hint">Tip: tap ▶️ to start. The dot is green when your agent is online.</div>
 </div>
 
 <script>
+// NOTE: Inside a Python f-string — double the braces.
 function libver() {{ return Math.floor(Date.now()/1000); }}
 const userId = "{user_id}";
 const TRACKS = {tracks_json};
+const API = (window.location.pathname.startsWith("/streamer/")) ? "/streamer/api" : "/api";
 
 function pickIndex() {{
   if (TRACKS.length === 0) return -1;
   return Math.floor(Math.random() * TRACKS.length);
 }}
+function urlFor(tid) {{
+  return API + "/relay/" + userId + "/" + tid + "?v=" + libver();
+}}
 function playIndex(i) {{
   const m = TRACKS[i]; if (!m) return;
-  const url = "/streamer/api/relay/" + userId + "/" + m.track_id + "?v=" + libver();
   const audio = document.getElementById('player');
-  const src = document.getElementById('src');
-  src.src = url;
+  audio.src = urlFor(m.track_id);
   audio.load();
   audio.play().catch(() => {{}});
-
   const albumText = m.album ? " (" + m.album + ")" : "";
   document.getElementById('now').innerText = m.artist + " — " + m.title + albumText;
 }}
@@ -549,12 +841,18 @@ function firstPlayKick() {{
   }}
 }}
 audio.addEventListener('play', firstPlayKick);
+audio.addEventListener('click', firstPlayKick);
+audio.addEventListener('touchstart', firstPlayKick);
+audio.addEventListener('error', () => {{
+  const src = audio.currentSrc || "(no source)";
+  alert("Audio error. Could not load: " + src);
+}});
 audio.addEventListener('ended', () => playNext());
 
 // Agent status
 async function refreshStatus() {{
   try {{
-    const res = await fetch("/streamer/api/agent/" + userId + "/status");
+    const res = await fetch(API + "/agent/" + userId + "/status");
     const j = await res.json();
     const dot = document.getElementById('stDot');
     if (j.online) dot.classList.add('ok'); else dot.classList.remove('ok');
