@@ -3,6 +3,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from mutagen import File as MutagenFile
 import requests
+import subprocess
 
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox, Toplevel, Label
@@ -40,6 +41,20 @@ def write_state(d: dict):
 def get_last_root() -> str | None:
     return read_state().get("last_root")
 
+def _remember_root(path: str):
+    st = read_state()
+    st["last_root"] = path
+    write_state(st)
+
+def tailscale_ok() -> bool:
+    try:
+        out = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=2)
+        if out.returncode != 0:
+            return False
+        return any(line.strip().startswith("100.") for line in out.stdout.splitlines())
+    except Exception:
+        return False
+    
 def _default_root() -> str:
     env = os.getenv("LIBRARY_PATH")
     if env and os.path.isdir(env):
@@ -218,11 +233,15 @@ class AgentGUI:
         self.root = root
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
 
-        self._server_holder = _ServerHolder()
+        # single pattern: keep a direct reference to the server
+        self.file_server = None
+        self._hb_stop = None  # heartbeat stopper
 
         row = 0
-        # Top line: user label inside the app
-        tk.Label(root, text=f"User: {USER_ID}", font=("Helvetica", 11, "bold")).grid(row=row, column=0, sticky="w", padx=10, pady=(10,4), columnspan=2)
+        # user label inside the app
+        tk.Label(root, text=f"User: {USER_ID}", font=("Helvetica", 11, "bold")).grid(
+            row=row, column=0, sticky="w", padx=10, pady=(10,4), columnspan=2
+        )
         row += 1
 
         # Music folder selector
@@ -254,35 +273,94 @@ class AgentGUI:
         root.grid_columnconfigure(1, weight=1)
         root.grid_rowconfigure(3, weight=1)  # log box grows
 
-        # auto-connect (serve + announce remembered root) a moment after UI shows
+        # close handler to stop server + heartbeat cleanly
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        # auto-connect (serve + announce remembered root) shortly after UI shows
         self.root.after(300, self.auto_connect)
 
+    # ----------------- heartbeat -----------------
+    def _start_heartbeat(self, base_url: str):
+        # avoid multiple concurrent heartbeats
+        if self._hb_stop is not None:
+            return
+        self._hb_stop = threading.Event()
+
+        def beat():
+            while not self._hb_stop.is_set():
+                try:
+                    requests.post(ANNOUNCE_URL, json={"user_id": USER_ID, "base_url": base_url}, timeout=5)
+                except Exception:
+                    pass
+                # LED refresh: green if tailscale looks ok
+                self._set_led(tailscale_ok())
+                self._hb_stop.wait(60)  # every 60s
+
+        threading.Thread(target=beat, daemon=True).start()
+
+    def _stop_heartbeat(self):
+        if self._hb_stop:
+            self._hb_stop.set()
+            self._hb_stop = None
+
+    # ----------------- ui helpers -----------------
     def log(self, s:str):
         self.log_box.insert(tk.END, s)
         self.log_box.see(tk.END)
         self.root.update_idletasks()
+
+    def _set_led(self, ok: bool):
+        self.led.delete("all")
+        color = "#16a34a" if ok else "#dc2626"  # green / red
+        self.led.create_oval(2, 2, 10, 10, fill=color, outline=color)
 
     def browse(self):
         initial = self.path_var.get() or _default_root()
         folder = filedialog.askdirectory(initialdir=initial, mustexist=True)
         if folder:
             self.path_var.set(folder)
-    
-    def _set_led(self, ok: bool):
-        self.led.delete("all")
-        color = "#16a34a" if ok else "#dc2626"  # green / red
-        self.led.create_oval(2, 2, 10, 10, fill=color, outline=color)
 
+    # ----------------- server lifecycle -----------------
+    def _start_local_server(self, path: str) -> str:
+        if self.file_server:
+            # restart on same/different path (cheap)
+            try:
+                self.file_server.stop()
+            except Exception:
+                pass
+            self.file_server = None
+
+        self.file_server = LocalFileServer(root_dir=path, port=DEFAULT_PORT, public_base_url=PUBLIC_BASE_URL)
+        self.file_server.start()
+        base = self.file_server.base_url()
+        self.log(f"📡 Local file server: {base}\n")
+        return base
+
+    def stop_server(self):
+        try:
+            self._stop_heartbeat()
+            if self.file_server:
+                self.file_server.stop()
+                self.file_server = None
+        except Exception:
+            pass
+
+    def on_close(self):
+        self.stop_server()
+        self.root.destroy()
+
+    # ----------------- flows -----------------
     def auto_connect(self):
-        # choose a root (env LIBRARY_PATH > last_root > $HOME)
         path = _default_root()
         self.path_var.set(path)
-        ok = tailscale_ok()
-        self._set_led(ok)
+
+        # initial LED
+        self._set_led(tailscale_ok())
 
         try:
-            base = _start_local_server(path, self.log, self._server_holder, DEFAULT_PORT, PUBLIC_BASE_URL)
+            base = self._start_local_server(path)
             announce_agent(USER_ID, base, self.log)
+            self._start_heartbeat(base)
             _remember_root(path)
             self.status_var.set("Status: connected (serving)")
         except Exception as e:
@@ -313,7 +391,6 @@ class AgentGUI:
             )
             replacing = messagebox.askyesno("Switch library root", msg, icon="warning")
             if not replacing:
-                # user declined replacement; still rescan without clearing?
                 if not messagebox.askyesno("Rescan without replacing?",
                                            "Proceed to rescan and append (no clear)?"):
                     return
@@ -327,8 +404,9 @@ class AgentGUI:
 
         # (re)start local file server & announce (ensures base_url fresh)
         try:
-            base = _start_local_server(path, self.log, self._server_holder, DEFAULT_PORT, PUBLIC_BASE_URL)
+            base = self._start_local_server(path)
             announce_agent(USER_ID, base, self.log)
+            self._start_heartbeat(base)
         except Exception as e:
             self.log(f"❌ Could not start local file server: {e}\n")
             return
@@ -343,7 +421,6 @@ class AgentGUI:
             self.status_var.set("Status: connected (scanned)")
 
         threading.Thread(target=work, daemon=True).start()
-
 
 # ---------- headless ----------
 def run_headless():
