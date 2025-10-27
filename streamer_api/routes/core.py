@@ -1,12 +1,108 @@
 from typing import Dict, Any, Optional
 import json, time, requests
+import os, subprocess
+from starlette.background import BackgroundTask
 from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, RedirectResponse
 from ..models import ScanPayload, AnnouncePayload
 from ..storage import load_lib, save_lib, load_agent, save_agent_stable
 from ..utils import normalize_rel_path, build_stream_url
 
+
 router = APIRouter(prefix="/api", tags=["core"])
+
+def _ffmpeg_cmd_for_http_input(url: str, abr_kbps: int = 192) -> list[str]:
+    # 192 kbps CBR is a sweet spot for mobile/Bluetooth reliability.
+    return [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel", "warning",
+
+        # INPUT resiliency (HTTP over variable links)
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
+
+        # Lower end-to-end latency / avoid input buffering
+        "-fflags", "+nobuffer",
+
+        "-i", url,                 # input
+
+        "-vn",
+        "-ac", "2",
+        "-ar", "44100",
+
+        # Stable CBR stream for radios/BT stacks
+        "-codec:a", "libmp3lame",
+        "-b:a", f"{abr_kbps}k",
+        "-maxrate", f"{abr_kbps}k",
+        "-bufsize", f"{abr_kbps*2}k",
+        "-write_xing", "0",        # don't wait to write VBR headers
+
+        "-f", "mp3",
+        "-"                        # stdout
+    ]
+
+@router.api_route("/relay-mp3/{user_id}/{track_id}", methods=["GET", "HEAD"])
+def relay_mp3(user_id: str, track_id: str, request: Request):
+    """
+    Transcode any upstream format to MP3-on-the-fly for mobile compatibility.
+    No byte-range seeking during live transcode (iOS will still play).
+    """
+    lib = load_lib(user_id)
+    track = lib["tracks"].get(track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="Unknown track_id")
+
+    url = build_stream_url(user_id, track)
+    if not url:
+        raise HTTPException(status_code=503, detail="Agent offline or base_url/rel_path unknown")
+
+    # HEAD: just say we’ll return MP3
+    if request.method == "HEAD":
+        headers = {
+            "Content-Type": "audio/mpeg",
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
+            "Accept-Ranges": "none",           
+            "Connection": "keep-alive",
+        }
+        return Response(status_code=200, headers=headers, media_type="audio/mpeg")
+
+    # GET: spawn ffmpeg and stream stdout
+    cmd = _ffmpeg_cmd_for_http_input(url, abr_kbps=192)
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ffmpeg spawn failed: {e}")
+
+    def _gen():
+        try:
+            while True:
+                chunk = proc.stdout.read(16384)  # 16 KiB
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    headers = {
+        "Content-Type": "audio/mpeg",
+        "Cache-Control": "no-store",
+        "Access-Control-Allow-Origin": "*",
+        "Accept-Ranges": "none",
+        "Connection": "keep-alive",
+    }
+    return StreamingResponse(
+        _gen(),
+        media_type="audio/mpeg",
+        headers=headers,
+        background=BackgroundTask(lambda: proc.kill() if proc.poll() is None else None),
+    )
 
 # -------- debug --------
 @router.get("/debug/peek/{user_id}/{track_id}")
@@ -201,7 +297,7 @@ def relay(user_id: str, track_id: str, request: Request):
         upstream = (
             requests.head(url, timeout=(5, 15), headers=headers, allow_redirects=True)
             if request.method == "HEAD"
-            else requests.get(url, stream=True, timeout=(5, 300), headers=headers)
+            else requests.get(url, stream=True, timeout=(5, 300), headers=headers, allow_redirects=True)
         )
     except requests.RequestException as e:
         print(f"[relay] upstream error user={user_id} track={track_id} url={url} err={e}")
@@ -223,8 +319,10 @@ def relay(user_id: str, track_id: str, request: Request):
         if v:
             passthrough[k] = v
 
+    passthrough["Access-Control-Allow-Origin"] = "*"
     passthrough.setdefault("Accept-Ranges", "bytes")
     passthrough.setdefault("Cache-Control", "no-store")
+    passthrough["Connection"] = "keep-alive"
 
     requested_range = ("Range" in headers) or (client_range is not None)
     total_len = upstream.headers.get("Content-Length")
@@ -237,6 +335,22 @@ def relay(user_id: str, track_id: str, request: Request):
             pass
 
     media = upstream.headers.get("Content-Type") or "audio/mpeg"
+
+    # ---- Auto-switch to MP3 only if the source isn't iOS-friendly audio ----
+    media_lc = media.lower()
+    IOS_OK = (
+        media_lc.startswith("audio/mpeg") or         # mp3
+        media_lc.startswith("audio/aac")  or         # raw aac
+        media_lc.startswith("audio/mp4")  or         # m4a containers often come as audio/mp4
+        media_lc.startswith("audio/x-m4a")           # some servers label m4a like this
+    )
+    if not IOS_OK:
+        qs = request.url.query
+        target = f"/streamer/api/relay-mp3/{user_id}/{track_id}"
+        if qs:
+            target = f"{target}?{qs}"
+        return RedirectResponse(url=target, status_code=302)
+    # ---- end auto-switch ----
 
     if request.method == "HEAD":
         return Response(status_code=status, headers=passthrough, media_type=media)
