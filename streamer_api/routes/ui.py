@@ -101,7 +101,7 @@ function libver() {{ return Math.floor(Date.now()/1000); }}
 const userId = "{user_id}";
 const API = (window.location.pathname.startsWith("/streamer/")) ? "/streamer/api" : "/api";
 
-// ---------- table snapshot for sorting ----------
+// ---------- table model ----------
 function snapshotRows() {{
   const rows = Array.from(document.querySelectorAll('tbody tr'));
   return rows.map(r => ({{
@@ -117,7 +117,6 @@ let order = ROWS.map((_, i) => i);
 let current = -1;
 let lastTid = null;
 
-// ---------- render helpers ----------
 function rowHtml(t) {{
   const mark = t.ok ? "✅" : "—";
   return (
@@ -140,10 +139,7 @@ function renderRows() {{
     if (ri >= 0) current = ri;
   }}
 }}
-
-// ---------- sorting ----------
-let sortKey = 'title';
-let sortDir = 1;
+let sortKey = 'title', sortDir = 1;
 function sortBy(k) {{
   if (sortKey === k) sortDir = -sortDir; else {{ sortKey = k; sortDir = 1; }}
   order.sort((i, j) => {{
@@ -153,8 +149,7 @@ function sortBy(k) {{
     if (a > b) return  1 * sortDir;
     return 0;
   }});
-  renderRows();
-  updateSortArrows();
+  renderRows(); updateSortArrows();
 }}
 function updateSortArrows() {{
   for (const k of ['title','artist','album']) {{
@@ -165,7 +160,6 @@ function updateSortArrows() {{
 }}
 updateSortArrows();
 
-// ---------- helpers for rows/meta ----------
 function trackIdAtRow(i) {{
   const row = document.querySelectorAll('tbody tr')[i];
   return row ? row.getAttribute('data-tid') : null;
@@ -185,21 +179,37 @@ function metaFor(tid) {{
   }};
 }}
 
-// ---------- audio plumbing (with optional crossfade) ----------
-const a1 = document.getElementById('player');   // visible
+// ---------- audio plumbing ----------
+const a1 = document.getElementById('player');   // visible + UI
 const a2 = document.getElementById('player2');  // hidden helper
 
-// Web Audio (optional, lazy-initialized when Crossfade is enabled)
+// Web Audio graph (built only if crossfade is ON)
 let AC = null, g1 = null, g2 = null, n1 = null, n2 = null;
-async function ensureAudioGraph() {{
-  ['click','touchstart','keydown'].forEach(evt => {{
-    window.addEventListener(evt, async () => {{
-      if (AC && AC.state === 'suspended') {{
-        try {{ await AC.resume(); }} catch {{}}
-      }}
-    }}, {{ once: false, passive: true }});
-  }});
+let ACTIVE = 1; // 1 = a1 drives audio, 2 = a2
 
+// Wait for 'canplay' (or short timeout) to avoid the 1s “stall then resume”
+function waitForCanPlay(el, timeoutMs = 8000) {{
+  return new Promise((resolve, reject) => {{
+    let done = false;
+    const ok = () => {{ if (!done) {{ done = true; cleanup(); resolve(); }} }};
+    const bad = (e) => {{ if (!done) {{ done = true; cleanup(); reject(e||new Error("audio error")); }} }};
+    const t = setTimeout(() => bad(new Error("canplay timeout")), timeoutMs);
+    function cleanup() {{
+      clearTimeout(t);
+      el.removeEventListener('canplay', ok);
+      el.removeEventListener('error', bad);
+      el.removeEventListener('stalled', bad);
+      el.removeEventListener('abort', bad);
+    }}
+    el.addEventListener('canplay', ok, {{ once: true }});
+    el.addEventListener('error',  bad, {{ once: true }});
+    el.addEventListener('stalled',bad, {{ once: true }});
+    el.addEventListener('abort',  bad, {{ once: true }});
+    try {{ if (el.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) ok(); }} catch {{}}
+  }});
+}}
+
+async function ensureAudioGraph() {{
   if (AC) return true;
   try {{
     const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -207,12 +217,15 @@ async function ensureAudioGraph() {{
     AC = new Ctx();
     n1 = AC.createMediaElementSource(a1);
     n2 = AC.createMediaElementSource(a2);
-    g1 = AC.createGain();
-    g2 = AC.createGain();
-    g1.gain.value = 1.0;
-    g2.gain.value = 0.0;
+    g1 = AC.createGain(); g2 = AC.createGain();
+    g1.gain.value = 1.0; g2.gain.value = 0.0;
     n1.connect(g1).connect(AC.destination);
     n2.connect(g2).connect(AC.destination);
+    ['click','touchstart','keydown'].forEach(evt => {{
+      window.addEventListener(evt, async () => {{
+        if (AC && AC.state === 'suspended') {{ try {{ await AC.resume(); }} catch {{}} }}
+      }});
+    }});
     return true;
   }} catch (e) {{
     console.warn("[xfade] graph init failed:", e);
@@ -221,26 +234,19 @@ async function ensureAudioGraph() {{
   }}
 }}
 
-// Persist crossfade toggle and lazily build audio graph when enabled
+// Persist crossfade toggle and lazily build graph
 document.addEventListener('DOMContentLoaded', () => {{
   const xcb = document.getElementById('xfade');
   if (!xcb) return;
-
-  xcb.checked = localStorage.getItem('rt-xfade') === '1';
-
+    xcb.checked = (localStorage.getItem('rt-xfade') === '1') && !/iPhone|iPad|Android/i.test(navigator.userAgent);
   xcb.addEventListener('change', async () => {{
     localStorage.setItem('rt-xfade', xcb.checked ? '1' : '0');
     if (xcb.checked) {{
       const ok = await ensureAudioGraph();
-      if (ok) {{
-        try {{ if (AC && AC.state === 'suspended') await AC.resume(); }} catch {{}}
-      }}
+      if (ok && AC && AC.state === 'suspended') {{ try {{ await AC.resume(); }} catch {{}} }}
     }}
   }});
-
-  if (xcb.checked) {{
-    xcb.dispatchEvent(new Event('change'));
-  }}
+  if (xcb.checked) xcb.dispatchEvent(new Event('change'));
 }});
 
 function setNowPlaying(tid) {{
@@ -248,54 +254,44 @@ function setNowPlaying(tid) {{
   const albumText = m.album ? " (" + m.album + ")" : "";
   document.getElementById('now').innerText = m.artist + " — " + m.title + albumText;
 }}
+function urlFor(tid) {{ return API + "/relay/" + userId + "/" + tid + "?v=" + libver(); }}
 
-function urlFor(tid) {{
-  return API + "/relay/" + userId + "/" + tid + "?v=" + libver();
-}}
-
-// Visible element play (no WebAudio required)
-function playId(tid) {{
+// --- plain play (always routes playback back to a1) ---
+async function playId(tid) {{
   const url = urlFor(tid);
-  a1.src = url;
-  a1.load();
-  a1.play().catch(() => {{}});
-
-  if (a2) try {{ a2.pause(); }} catch (e) {{}}
-
+  a1.src = url; a1.load();
+  try {{ await waitForCanPlay(a1, 8000); }} catch {{}}
+  try {{ await a1.play(); }} catch {{}}
+  try {{ a2.pause(); }} catch {{}}
+  ACTIVE = 1;
   setNowPlaying(tid);
-  const ri = rowIndexOfTid(tid);
-  if (ri >= 0) current = ri;
+  const ri = rowIndexOfTid(tid); if (ri >= 0) current = ri;
   lastTid = tid;
 }}
 
-// Crossfade helper
+// --- crossfade + *handoff back to a1* after the fade ---
 async function xfadeTo(tid) {{
   const toggle = document.getElementById('xfade');
   const secsEl = document.getElementById('xfadeSecs');
   const secs = Math.max(0, Math.min(10, Number(secsEl ? secsEl.value : 0) || 0));
-
-  if (!toggle || !toggle.checked || secs <= 0 || !a2) {{
-    playId(tid); return;
-  }}
+  if (!toggle || !toggle.checked || secs <= 0) {{ await playId(tid); return; }}
 
   const ok = await ensureAudioGraph();
-  if (!ok || !g1 || !g2) {{ playId(tid); return; }}
+  if (!ok || !g1 || !g2) {{ await playId(tid); return; }}
+  try {{ if (AC.state === 'suspended') await AC.resume(); }} catch {{}}
 
-  try {{ if (AC.state === 'suspended') await AC.resume(); }} catch (e) {{}}
+  const active = (ACTIVE === 1 ? a1 : a2);
+  const helper = (ACTIVE === 1 ? a2 : a1);
+  const gActive = (ACTIVE === 1 ? g1 : g2);
+  const gHelper = (ACTIVE === 1 ? g2 : g1);
 
-  const active = (!a1.paused && a1.currentSrc) ? a1 : ((!a2.paused && a2.currentSrc) ? a2 : a1);
-  const helper = (active === a1) ? a2 : a1;
-  const gActive = (active === a1) ? g1 : g2;
-  const gHelper = (helper === a1) ? g1 : g2;
+  // 1) Prepare helper and prebuffer
+  const url = urlFor(tid);
+  helper.src = url; helper.load();
+  try {{ await waitForCanPlay(helper, 8000); }} catch (e) {{ console.warn("[xfade] helper timeout:", e); await playId(tid); return; }}
+  try {{ await helper.play(); }} catch {{ await playId(tid); return; }}
 
-  helper.src = urlFor(tid);
-  try {{ helper.load(); }} catch (e) {{}}
-  helper.currentTime = 0;
-  try {{
-    gHelper.gain.setValueAtTime(0, AC.currentTime);
-    helper.play().catch(() => {{}}); 
-  }} catch (e) {{ playId(tid); return; }}
-
+  // 2) Run gain ramps
   const now = AC.currentTime;
   gActive.gain.cancelScheduledValues(now);
   gHelper.gain.cancelScheduledValues(now);
@@ -304,33 +300,47 @@ async function xfadeTo(tid) {{
   gActive.gain.linearRampToValueAtTime(0.0, now + secs);
   gHelper.gain.linearRampToValueAtTime(1.0, now + secs);
 
-  setTimeout(() => {{
-    try {{ active.pause(); }} catch (e) {{}}
-    if (helper !== a1) {{
+  setNowPlaying(tid);
+  const ri = rowIndexOfTid(tid); if (ri >= 0) current = ri;
+  lastTid = tid;
+
+  // 3) After fade, HANDOFF to a1 so the UI bar controls the real audio.
+  setTimeout(async () => {{
+    try {{
+      // If helper already IS a1, we're done
+      if (helper === a1) {{
+        ACTIVE = 1;
+        if (g1 && g2) {{ g1.gain.value = 1.0; g2.gain.value = 0.0; }}
+        try {{ active.pause(); }} catch {{}}
+        return;
+      }}
+
+      // Sync a1 to helper without audible gap
+      const tcur = (helper.currentTime || 0);
       a1.src = helper.src;
       a1.load();
-      a1.currentTime = helper.currentTime;
-      a1.play().catch(() => {{}});
+      try {{ a1.currentTime = tcur; }} catch {{}}
+      try {{ await waitForCanPlay(a1, 8000); }} catch {{}}
+      try {{ await a1.play(); }} catch {{ }}
 
+      // Now stop helper and normalize gains
+      try {{ helper.pause(); }} catch {{}}
+      ACTIVE = 1;
       if (g1 && g2) {{ g1.gain.value = 1.0; g2.gain.value = 0.0; }}
-      try {{ helper.pause(); }} catch (e) {{}}
-    }} else {{
-      if (g1 && g2) {{ g1.gain.value = 1.0; g2.gain.value = 0.0; }}
-      try {{ a2.pause(); }} catch (e) {{}}
+    }} catch (e) {{
+      console.warn("[xfade] handoff failed, staying on helper:", e);
+      ACTIVE = (helper === a1) ? 1 : 2;
     }}
   }}, Math.ceil((secs + 0.05) * 1000));
-
-  setNowPlaying(tid);
-  const ri = rowIndexOfTid(tid);
-  if (ri >= 0) current = ri;
-  lastTid = tid;
 }}
 
 // ---------- queue navigation ----------
 function pickNextIndex() {{
   const shuffle = document.getElementById('shuffle').checked;
   if (ROWS.length === 0) return -1;
-  return shuffle ? Math.floor(Math.random() * ROWS.length) : (current + 1) % ROWS.length;
+  if (shuffle) return Math.floor(Math.random() * ROWS.length);
+  // sequential
+  return (current + 1) % ROWS.length;
 }}
 function pickPrevIndex() {{
   if (ROWS.length === 0) return -1;
@@ -353,7 +363,7 @@ function playPrev() {{
   useX ? xfadeTo(tid) : playId(tid);
 }}
 
-// ---------- make native ▶️ start playback even with no src ----------
+// Ensure native ▶️ kicks off a valid source and respects the crossfade setting
 function kickIfEmpty() {{
   if (!a1.currentSrc || a1.currentSrc === "" || a1.currentSrc === window.location.href) {{
     if (current >= 0) {{
@@ -368,23 +378,20 @@ function kickIfEmpty() {{
     setTimeout(() => a1.play().catch(() => {{}}), 0);
   }}
 }}
-a1.addEventListener('play',  kickIfEmpty);
-a1.addEventListener('click', kickIfEmpty);
-a1.addEventListener('touchstart', kickIfEmpty);
 
-// Helpful error surfacing if a stream fails to load
+// Helpful surfacing
 a1.addEventListener('error', () => {{
   const src = a1.currentSrc || "(no source)";
   alert("Audio error. Could not load: " + src);
 }});
 
-// ---------- autoplay next on end ----------
+// Autoplay next when finished
 a1.addEventListener('ended', () => {{
   const autoplay = document.getElementById('autoplay').checked;
   if (autoplay) playNext();
 }});
 
-// ---------- Agent status dot ----------
+// Agent status dot
 async function refreshStatus() {{
   try {{
     const res = await fetch(API + "/agent/" + userId + "/status");
@@ -398,18 +405,10 @@ async function refreshStatus() {{
 refreshStatus();
 setInterval(refreshStatus, 10000);
 
-// ---------- Clear library ----------
-async function confirmClear() {{
-  if (!confirm("Are you sure you want to CLEAR your library on the server?")) return;
-  try {{
-    const res = await fetch(API + "/library/" + userId + "/clear", {{ method: "POST" }});
-    if (!res.ok) throw new Error(await res.text());
-    location.reload();
-  }} catch (e) {{
-    alert("Clear failed: " + e.message);
-  }}
-}}
+// Init arrows once more after render
+updateSortArrows();
 </script>
+
 
 </body>
 </html>"""
