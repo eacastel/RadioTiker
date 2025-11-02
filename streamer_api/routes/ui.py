@@ -164,6 +164,19 @@ function trackIdAtRow(i) {{
   const row = document.querySelectorAll('tbody tr')[i];
   return row ? row.getAttribute('data-tid') : null;
 }}
+
+async function confirmClear() {{
+  if (!window.confirm("Are you sure you want to CLEAR your library on the server?")) return;
+  try {{
+    const res = await fetch(API + "/library/" + userId + "/clear", {{ method: "POST" }});
+    if (!res.ok) throw new Error(await res.text());
+    // Reload after successful clear so the table reflects empty state
+    location.reload();
+  }} catch (e) {{
+    alert("Clear failed: " + (e?.message || e));
+  }}
+}}
+
 function rowIndexOfTid(tid) {{
   const rows = Array.from(document.querySelectorAll('tbody tr'));
   for (let i=0;i<rows.length;i++) if (rows[i].getAttribute('data-tid')===tid) return i;
