@@ -1,39 +1,109 @@
 # local_file_server.py
-import os, threading, socket, subprocess
+import os, threading, socket, subprocess, re, shutil
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from socketserver import TCPServer
 from urllib.parse import quote
-import shutil
 
 class _QuietHandler(SimpleHTTPRequestHandler):
-    # Silence default logging
+    protocol_version = "HTTP/1.1"  # helps some clients
+
     def log_message(self, format, *args):
         pass
 
-    # Tolerate clients that seek/stop and close the socket mid-transfer
-    def do_GET(self):
+    def do_HEAD(self):
         try:
-            return super().do_GET()
+            f = self.send_head()
+            if f:
+                f.close()
         except (BrokenPipeError, ConnectionResetError):
-            # Client went away—ignore
             return
 
-    # Chunked copy with disconnect tolerance
+    def do_GET(self):
+        try:
+            f = self.send_head()
+            if not f:
+                return
+            try:
+                self.copyfile(f, self.wfile)
+            finally:
+                f.close()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def copyfile(self, source, outputfile):
         try:
             shutil.copyfileobj(source, outputfile, length=64 * 1024)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    # Final write/flush can raise on disconnect—ignore
     def finish(self):
         try:
             super().finish()
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def send_head(self):
+        path = self.translate_path(self.path)
+        if os.path.isdir(path):
+            return super().send_head()
+
+        ctype = self.guess_type(path)
+        try:
+            f = open(path, "rb")
+        except OSError:
+            self.send_error(404, "File not found")
+            return None
+
+        fs = os.fstat(f.fileno())
+        size = fs.st_size
+
+        # Always advertise range support
+        range_header = self.headers.get("Range")
+        if not range_header:
+            self.send_response(200)
+            self.send_header("Content-type", ctype)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            return f
+
+        # Parse: Range: bytes=start-end
+        m = re.match(r"bytes=(\d+)-(\d*)$", range_header.strip())
+        if not m:
+            f.close()
+            self.send_error(416, "Invalid Range")
+            return None
+
+        start = int(m.group(1))
+        end_s = m.group(2)
+        end = int(end_s) if end_s else (size - 1)
+
+        if start >= size or start < 0 or end < start:
+            f.close()
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Accept-Ranges", "bytes")
+            self.end_headers()
+            return None
+
+        if end >= size:
+            end = size - 1
+
+        length = (end - start) + 1
+        f.seek(start)
+
+        self.send_response(206)
+        self.send_header("Content-type", ctype)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+        return f
+
+
 class _RootedThreadingHTTPServer(ThreadingHTTPServer):
-    # Reuse sockets so restarts don’t “stick”
     allow_reuse_address = True
     daemon_threads = True
 

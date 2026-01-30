@@ -1,3 +1,5 @@
+# thin_agent_gui.py
+
 import os, time, threading, hashlib, json
 from pathlib import Path
 from dotenv import load_dotenv
