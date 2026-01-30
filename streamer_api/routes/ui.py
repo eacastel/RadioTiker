@@ -447,15 +447,15 @@ def radio_page(user_id: str):
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>{user_id} — Radio</title>
 <style>
-  body{{{{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;padding:20px}}}}
-  .bar{{{{max-width:900px;margin:0 auto}}}}
-  .dot{{{{width:10px;height:10px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:6px;background:#bbb}}}}
-  .dot.ok{{{{background:#16a34a}}}}
-  .row{{{{display:flex;align-items:center;gap:12px;flex-wrap:wrap}}}}
-  .now{{{{margin-top:10px}}}}
-  .hint{{{{color:#666;font-size:14px;margin-top:6px}}}}
-  .btn{{{{padding:6px 10px;border:1px solid #ddd;border-radius:6px;background:#fafafa;cursor:pointer}}}}
-  .btn:hover{{{{filter:brightness(1.03)}}}}
+  body{{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;padding:20px}}
+  .bar{{max-width:900px;margin:0 auto}}
+  .dot{{width:10px;height:10px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:6px;background:#bbb}}
+  .dot.ok{{background:#16a34a}}
+  .row{{display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
+  .now{{margin-top:10px}}
+  .hint{{color:#666;font-size:14px;margin-top:6px}}
+  .btn{{padding:6px 10px;border:1px solid #ddd;border-radius:6px;background:#fafafa;cursor:pointer}}
+  .btn:hover{{filter:brightness(1.03)}}
 </style>
 </head>
 <body>
@@ -474,47 +474,42 @@ def radio_page(user_id: str):
 </div>
 
 <script>
-// NOTE: Inside a Python f-string — ALL braces are doubled {{{{ }}}}.
+// NOTE: Inside a Python f-string — ALL braces are doubled {{ }}.
 
-function libver() {{{{ return Math.floor(Date.now()/1000); }}}}
+function libver() {{ return Math.floor(Date.now()/1000); }}
 const userId = "{user_id}";
 const TRACKS = {tracks_json};
 
 // Robust API base: if path contains /streamer/ anywhere, use /streamer/api
-const API = (window.location.pathname.indexOf("/streamer/") !== -1) ? "/streamer/api" : "/api";
+const API = "/streamer/api";
 
 // Small logger for visibility
-function logAudioState(prefix, el) {{{{
+function logAudioState(prefix, el) {{
   const states = ["HAVE_NOTHING","HAVE_METADATA","HAVE_CURRENT_DATA","HAVE_FUTURE_DATA","HAVE_ENOUGH_DATA"];
-  console.log(`[audio] ${{{{prefix}}}}`, {{{{
+  console.log(`[audio] ${{prefix}}`, {{
     src: el.currentSrc,
     readyState: states[el.readyState] || el.readyState,
     paused: el.paused, ended: el.ended, networkState: el.networkState,
-    error: el.error && {{{{code: el.error.code, msg: el.error.message}}}}
-  }}}});
-}}}}
+    error: el.error && {{code: el.error.code, msg: el.error.message}}
+  }});
+}}
 
 // Pick a random track
-function pickIndex() {{{{
+function pickIndex() {{
   if (TRACKS.length === 0) return -1;
   return Math.floor(Math.random() * TRACKS.length);
-}}}}
+}}
 
-function urlFor(tid) {{{{
-  return API + "/relay/" + userId + "/" + tid + "?v=" + libver();
-}}}}
+function urlFor(tid) {{
+  return API + "/relay-mp3/" + userId + "/" + tid + "?v=" + libver();
+}}
 
 // Use a <source type="audio/mpeg"> to help stricter browsers
-function setAudioSrc(audio, url) {{{{
-  while (audio.firstChild) audio.removeChild(audio.firstChild);
-  const src = document.createElement('source');
-  src.id = "src";
-  src.src = url;
-  src.type = "audio/mpeg";
-  audio.appendChild(src);
-}}}}
+function setAudioSrc(audio, url) {{
+  audio.src = url;
+}}
 
-function playIndex(i) {{{{
+function playIndex(i) {{
   const m = TRACKS[i]; if (!m) return;
   const audio = document.getElementById('player');
   const url = urlFor(m.track_id);
@@ -524,21 +519,21 @@ function playIndex(i) {{{{
               .catch(() => logAudioState('play-catch', audio));
   const albumText = m.album ? " (" + m.album + ")" : "";
   document.getElementById('now').innerText = m.artist + " — " + m.title + albumText;
-}}}}
+}}
 let current = -1;
-function playNext() {{{{ current = pickIndex(); if (current >= 0) playIndex(current); }}}}
+function playNext() {{ current = pickIndex(); if (current >= 0) playIndex(current); }}
 
 // Wire the explicit Next button (gives guaranteed user gesture)
 document.getElementById('btnNext').addEventListener('click', () => playNext());
 
 // Also allow the native ▶️ to kick the first track
 const audio = document.getElementById('player');
-function firstPlayKick() {{{{
-  if (!audio.currentSrc || audio.currentSrc === "" || audio.currentSrc === window.location.href) {{{{
+function firstPlayKick() {{
+  if (!audio.currentSrc || audio.currentSrc === "" || audio.currentSrc === window.location.href) {{
     playNext();
-    setTimeout(() => audio.play().catch(() => {{{{}}}}), 0);
-  }}}}
-}}}}
+    setTimeout(() => audio.play().catch(() => {{}}), 0);
+  }}
+}}
 audio.addEventListener('play', firstPlayKick);
 audio.addEventListener('click', firstPlayKick);
 audio.addEventListener('touchstart', firstPlayKick);
@@ -551,24 +546,24 @@ audio.addEventListener('playing',        () => logAudioState('playing', audio));
 audio.addEventListener('stalled',        () => logAudioState('stalled', audio));
 audio.addEventListener('suspend',        () => logAudioState('suspend', audio));
 audio.addEventListener('pause',          () => logAudioState('pause', audio));
-audio.addEventListener('error', () => {{{{
+audio.addEventListener('error', () => {{
   const src = audio.currentSrc || "(no source)";
   console.error("[audio] error", audio.error, "src=", src);
   alert("Audio error. Could not load: " + src);
-}}}});
+}});
 audio.addEventListener('ended', () => playNext());
 
 // Agent status
-async function refreshStatus() {{{{
-  try {{{{
+async function refreshStatus() {{
+  try {{
     const res = await fetch(API + "/agent/" + userId + "/status");
     const j = await res.json();
     const dot = document.getElementById('stDot');
     if (j.online) dot.classList.add('ok'); else dot.classList.remove('ok');
-  }}}} catch (e) {{{{
+  }} catch (e) {{
     document.getElementById('stDot').classList.remove('ok');
-  }}}}
-}}}}
+  }}
+}}
 refreshStatus();
 setInterval(refreshStatus, 10000);
 </script>

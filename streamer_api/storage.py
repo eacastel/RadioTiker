@@ -3,7 +3,7 @@ from typing import Dict, Any
 import json, time
 
 # radio-tiker-core/  (two levels up from this file)
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data" / "user-libraries"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 

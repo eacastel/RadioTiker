@@ -1,9 +1,9 @@
 from typing import Dict, Any, Optional
 import json, time, requests
-import os, subprocess
+import os, subprocess, re
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse, RedirectResponse, Response
 from starlette.background import BackgroundTask
-from fastapi import APIRouter, HTTPException, Request, Response
-from fastapi.responses import StreamingResponse, RedirectResponse
 from ..models import ScanPayload, AnnouncePayload
 from ..storage import load_lib, save_lib, load_agent, save_agent_stable
 from ..utils import normalize_rel_path, build_stream_url
@@ -261,37 +261,34 @@ def relay(user_id: str, track_id: str, request: Request):
             passthrough[k] = v
 
     passthrough["Access-Control-Allow-Origin"] = "*"
-    passthrough.setdefault("Accept-Ranges", "bytes")
     passthrough.setdefault("Cache-Control", "no-store")
-    passthrough["Connection"] = "keep-alive"
+    passthrough["Connection"] = "close"
 
-    requested_range = ("Range" in headers) or (client_range is not None)
-    total_len = upstream.headers.get("Content-Length")
-    if requested_range and status == 200 and total_len and not passthrough.get("Content-Range"):
-        try:
-            total = int(total_len)
-            passthrough["Content-Range"] = f"bytes 0-{total-1}/{total}"
-            status = 206
-        except Exception:
-            pass
-
-    media = upstream.headers.get("Content-Type") or "audio/mpeg"
-
-    # ---- Auto-switch to MP3 only if the source isn't iOS-friendly audio ----
+    media = upstream.headers.get("Content-Type") or "application/octet-stream"
     media_lc = media.lower()
+
+    # If it's FLAC, don't risk it: many browsers choke on FLAC-with-picture streams.
+    if media_lc.startswith("audio/flac") or media_lc.startswith("audio/x-flac"):
+        target_url = str(request.url_for("relay_mp3", user_id=user_id, track_id=track_id))
+        if request.url.query:
+            target_url = f"{target_url}?{request.url.query}"
+        return RedirectResponse(url=target_url, status_code=302)
+
+    # Otherwise pass through (mp3/aac/etc)
     IOS_OK = (
-        media_lc.startswith("audio/mpeg") or         # mp3
-        media_lc.startswith("audio/aac")  or         # raw aac
-        media_lc.startswith("audio/mp4")  or         # m4a containers often come as audio/mp4
-        media_lc.startswith("audio/x-m4a")           # some servers label m4a like this
+        media_lc.startswith("audio/mpeg") or
+        media_lc.startswith("audio/aac")  or
+        media_lc.startswith("audio/mp4")  or
+        media_lc.startswith("audio/x-m4a")
     )
+
     if not IOS_OK:
-        qs = request.url.query
-        target = f"/streamer/api/relay-mp3/{user_id}/{track_id}"
-        if qs:
-            target = f"{target}?{qs}"
-        return RedirectResponse(url=target, status_code=302)
-    # ---- end auto-switch ----
+        target_url = str(request.url_for("relay_mp3", user_id=user_id, track_id=track_id))
+        if request.url.query:
+            target_url = f"{target_url}?{request.url.query}"
+        return RedirectResponse(url=target_url, status_code=302)
+
+        # ---- end auto-switch ----
 
     if request.method == "HEAD":
         return Response(status_code=status, headers=passthrough, media_type=media)
@@ -303,7 +300,7 @@ def relay(user_id: str, track_id: str, request: Request):
 
     return StreamingResponse(gen(), media_type=media, headers=passthrough, status_code=status)
 
-@router.get("/relay-mp3/{user_id}/{track_id}")
+@router.api_route("/relay-mp3/{user_id}/{track_id}", methods=["GET", "HEAD"], name="relay_mp3")
 def relay_mp3(user_id: str, track_id: str, request: Request):
     lib = load_lib(user_id)
     track = lib["tracks"].get(track_id)
@@ -314,13 +311,30 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
     if not url:
         raise HTTPException(status_code=503, detail="Agent offline or base_url/rel_path unknown")
 
-    cmd = _ffmpeg_cmd_for_http_input(url, abr_kbps=192)
+    if request.method == "HEAD":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store, must-revalidate",
+                "Connection": "close",
+                "Content-Type": "audio/mpeg",
+                "Accept-Ranges": "none",
+                "X-Accel-Buffering": "no",
+                "Content-Length": "0",
+            },
+        )
 
+    # IMPORTANT: ignore Range for live transcode (do not 416)
+    # (You can log it if you want)
+    # range_h = request.headers.get("range")
+
+    cmd = _ffmpeg_cmd_for_http_input(url, abr_kbps=192)
     try:
         p = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             bufsize=0,
         )
     except Exception as e:
@@ -335,15 +349,15 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
                     break
                 yield chunk
         finally:
-            try:
-                p.kill()
-            except Exception:
-                pass
+            try: p.kill()
+            except Exception: pass
 
     headers = {
         "Access-Control-Allow-Origin": "*",
         "Cache-Control": "no-store, must-revalidate",
         "Connection": "close",
+        "Accept-Ranges": "none",
+        "X-Accel-Buffering": "no",
     }
 
     return StreamingResponse(gen(), media_type="audio/mpeg", headers=headers)

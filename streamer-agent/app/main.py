@@ -694,10 +694,87 @@ async function xfadeTo(tid) {{
 
 
 // ---------- queue navigation ----------
+// ---------- shuffle bag (no repeats until exhausted) ----------
+const SHUFFLE_KEY = "rt_shufflebag_v1";
+
+function _fyShuffle(a) {{
+  for (let i = a.length - 1; i > 0; i--) {{
+    const j = Math.floor(Math.random() * (i + 1));
+    const tmp = a[i]; a[i] = a[j]; a[j] = tmp;
+  }}
+  return a;
+}}
+
+function _loadBag() {{
+  try {{
+    const raw = localStorage.getItem(SHUFFLE_KEY);
+    if (!raw) return null;
+    const j = JSON.parse(raw);
+    if (j && Array.isArray(j.bag)) return j.bag;
+  }} catch (e) {{}}
+  return null;
+}}
+
+function _saveBag(bag) {{
+  try {{ localStorage.setItem(SHUFFLE_KEY, JSON.stringify({{ bag: bag }})); }} catch (e) {{}}
+}}
+
+function _allTids() {{
+  // current table order (after sorting) is what user expects
+  const tids = [];
+  const trs = document.querySelectorAll('tbody tr');
+  for (let i = 0; i < trs.length; i++) {{
+    const tid = trs[i].getAttribute('data-tid');
+    if (tid) tids.push(tid);
+  }}
+  return tids;
+}}
+
+function _freshBag() {{
+  const tids = _allTids();
+  return _fyShuffle(tids.slice());
+}}
+
+function _nextFromBag() {{
+  let bag = _loadBag();
+  const tids = _allTids();
+  const all = new Set(tids);
+
+  // init / empty
+  if (!bag || bag.length === 0) bag = _freshBag();
+
+  // drop tids that no longer exist (library changed)
+  bag = bag.filter(t => all.has(t));
+
+  // add new tids not present in bag (library grew)
+  const inBag = new Set(bag);
+  for (let i = 0; i < tids.length; i++) {{
+    const t = tids[i];
+    if (!inBag.has(t)) bag.push(t);
+  }}
+
+  // still empty? rebuild
+  if (bag.length === 0) bag = _freshBag();
+
+  // pop next
+  const nextTid = bag.shift();
+  _saveBag(bag);
+
+  // map tid -> current row index
+  const idx = rowIndexOfTid(nextTid);
+  return idx >= 0 ? idx : 0;
+}}
+
 function pickNextIndex() {{
   const shuffle = document.getElementById('shuffle').checked;
   if (ROWS.length === 0) return -1;
-  return shuffle ? Math.floor(Math.random() * ROWS.length) : (current + 1) % ROWS.length;
+
+  if (shuffle) {{
+    return _nextFromBag();
+  }}
+
+  // sequential mode
+  return (current + 1) % ROWS.length;
 }}
 function pickPrevIndex() {{
   if (ROWS.length === 0) return -1;
@@ -802,15 +879,15 @@ def radio_page(user_id: str):
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>{user_id} — Radio</title>
 <style>
-  body{{{{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;padding:20px}}}}
-  .bar{{{{max-width:900px;margin:0 auto}}}}
-  .dot{{{{width:10px;height:10px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:6px;background:#bbb}}}}
-  .dot.ok{{{{background:#16a34a}}}}
-  .row{{{{display:flex;align-items:center;gap:12px;flex-wrap:wrap}}}}
-  .now{{{{margin-top:10px}}}}
-  .hint{{{{color:#666;font-size:14px;margin-top:6px}}}}
-  .btn{{{{padding:6px 10px;border:1px solid #ddd;border-radius:6px;background:#fafafa;cursor:pointer}}}}
-  .btn:hover{{{{filter:brightness(1.03)}}}}
+  body{{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;padding:20px}}
+  .bar{{max-width:900px;margin:0 auto}}
+  .dot{{width:10px;height:10px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:6px;background:#bbb}}
+  .dot.ok{{background:#16a34a}}
+  .row{{display:flex;align-items:center;gap:12px;flex-wrap:wrap}}
+  .now{{margin-top:10px}}
+  .hint{{color:#666;font-size:14px;margin-top:6px}}
+  .btn{{padding:6px 10px;border:1px solid #ddd;border-radius:6px;background:#fafafa;cursor:pointer}}
+  .btn:hover{{filter:brightness(1.03)}}
 </style>
 </head>
 <body>
@@ -829,9 +906,9 @@ def radio_page(user_id: str):
 </div>
 
 <script>
-// NOTE: Inside a Python f-string — ALL braces are doubled {{{{ }}}}.
+// NOTE: Inside a Python f-string — ALL braces are doubled {{ }}.
 
-function libver() {{{{ return Math.floor(Date.now()/1000); }}}}
+function libver() {{ return Math.floor(Date.now()/1000); }}
 const userId = "{user_id}";
 const TRACKS = {tracks_json};
 
@@ -839,61 +916,80 @@ const TRACKS = {tracks_json};
 const API = (window.location.pathname.indexOf("/streamer/") !== -1) ? "/streamer/api" : "/api";
 
 // Small logger for visibility
-function logAudioState(prefix, el) {{{{
+function logAudioState(prefix, el) {{
   const states = ["HAVE_NOTHING","HAVE_METADATA","HAVE_CURRENT_DATA","HAVE_FUTURE_DATA","HAVE_ENOUGH_DATA"];
-  console.log(`[audio] ${{{{prefix}}}}`, {{{{
+  console.log("[audio] " + prefix, {{
     src: el.currentSrc,
     readyState: states[el.readyState] || el.readyState,
     paused: el.paused, ended: el.ended, networkState: el.networkState,
-    error: el.error && {{{{code: el.error.code, msg: el.error.message}}}}
-  }}}});
-}}}}
+    error: el.error && {{code: el.error.code, msg: el.error.message}}
+  }});
+}}
 
 // Pick a random track
-function pickIndex() {{{{
-  if (TRACKS.length === 0) return -1;
-  return Math.floor(Math.random() * TRACKS.length);
-}}}}
+let current = -1;
 
-function urlFor(tid) {{{{
+function pickNextIndex() {{
+  if (!TRACKS || TRACKS.length === 0) return -1;
+
+  // simple random
+  let i = Math.floor(Math.random() * TRACKS.length);
+
+  // avoid immediate repeat when possible
+  if (TRACKS.length > 1 && i === current) i = (i + 1) % TRACKS.length;
+
+  return i;
+}}
+
+function urlFor(tid) {{
   return API + "/relay/" + userId + "/" + tid + "?v=" + libver();
-}}}}
+}}
 
 // Use a <source type="audio/mpeg"> to help stricter browsers
-function setAudioSrc(audio, url) {{{{
+function setAudioSrc(audio, url) {{
+  audio.removeAttribute('src'); // avoids weird state in some browsers
   while (audio.firstChild) audio.removeChild(audio.firstChild);
-  const src = document.createElement('source');
-  src.id = "src";
-  src.src = url;
-  src.type = "audio/mpeg";
-  audio.appendChild(src);
-}}}}
+  audio.src = url;              // direct src, no <source> type
+}}
 
-function playIndex(i) {{{{
-  const m = TRACKS[i]; if (!m) return;
+function playIndex(i) {{
+  const m = TRACKS[i];
+  if (!m) return;
+
   const audio = document.getElementById('player');
   const url = urlFor(m.track_id);
+
   setAudioSrc(audio, url);
   audio.load();
-  audio.play().then(() => logAudioState('playing-started', audio))
-              .catch(() => logAudioState('play-catch', audio));
+  audio.play().catch(() => {{}});
+
   const albumText = m.album ? " (" + m.album + ")" : "";
-  document.getElementById('now').innerText = m.artist + " — " + m.title + albumText;
-}}}}
-let current = -1;
-function playNext() {{{{ current = pickIndex(); if (current >= 0) playIndex(current); }}}}
+  document.getElementById('now').innerText =
+    m.artist + " — " + m.title + albumText;
+}}
+
+function playNext() {{
+  const i = pickNextIndex();
+  if (i < 0) {{
+    alert("No tracks found.");
+    return;
+  }}
+  current = i;
+  playIndex(current);
+}}
+
 
 // Wire the explicit Next button (gives guaranteed user gesture)
 document.getElementById('btnNext').addEventListener('click', () => playNext());
 
 // Also allow the native ▶️ to kick the first track
 const audio = document.getElementById('player');
-function firstPlayKick() {{{{
-  if (!audio.currentSrc || audio.currentSrc === "" || audio.currentSrc === window.location.href) {{{{
+function firstPlayKick() {{
+  if (!audio.currentSrc || audio.currentSrc === "" || audio.currentSrc === window.location.href) {{
     playNext();
-    setTimeout(() => audio.play().catch(() => {{{{}}}}), 0);
-  }}}}
-}}}}
+    setTimeout(() => audio.play().catch(() => {{}}), 0);
+  }}
+}}
 audio.addEventListener('play', firstPlayKick);
 audio.addEventListener('click', firstPlayKick);
 audio.addEventListener('touchstart', firstPlayKick);
@@ -906,24 +1002,24 @@ audio.addEventListener('playing',        () => logAudioState('playing', audio));
 audio.addEventListener('stalled',        () => logAudioState('stalled', audio));
 audio.addEventListener('suspend',        () => logAudioState('suspend', audio));
 audio.addEventListener('pause',          () => logAudioState('pause', audio));
-audio.addEventListener('error', () => {{{{
+audio.addEventListener('error', () => {{
   const src = audio.currentSrc || "(no source)";
   console.error("[audio] error", audio.error, "src=", src);
   alert("Audio error. Could not load: " + src);
-}}}});
+}});
 audio.addEventListener('ended', () => playNext());
 
 // Agent status
-async function refreshStatus() {{{{
-  try {{{{
+async function refreshStatus() {{
+  try {{
     const res = await fetch(API + "/agent/" + userId + "/status");
     const j = await res.json();
     const dot = document.getElementById('stDot');
     if (j.online) dot.classList.add('ok'); else dot.classList.remove('ok');
-  }}}} catch (e) {{{{
+  }} catch (e) {{
     document.getElementById('stDot').classList.remove('ok');
-  }}}}
-}}}}
+  }}
+}}
 refreshStatus();
 setInterval(refreshStatus, 10000);
 </script>
