@@ -23,11 +23,16 @@ def _ffmpeg_cmd_for_http_input(url: str, abr_kbps: int = 192) -> list[str]:
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_on_network_error", "1",
+        "-reconnect_at_eof", "1",
+        "-reconnect_delay_max", "2",
 
         # Lower end-to-end latency / avoid input buffering
         "-fflags", "+nobuffer",
 
-        "-i", url,                 # input
+        "-i", url,            
+        "-map", "0:a:0",
+        "-sn",
+        "-dn",
 
         "-vn",
         "-ac", "2",
@@ -214,13 +219,18 @@ def relay(user_id: str, track_id: str, request: Request):
     # Probe upstream range capability
     upstream_accepts_ranges = False
     try:
-        probe_h = dict(base_headers); probe_h["Range"] = "bytes=0-0"
-        probe = requests.head(url, timeout=(5, 10), headers=probe_h, allow_redirects=True)
-        if probe.status_code == 206 or \
-           probe.headers.get("Accept-Ranges", "").lower() == "bytes" or \
-           probe.headers.get("Content-Range"):
+        probe_h = dict(base_headers)
+        probe_h["Range"] = "bytes=0-0"
+        probe = requests.get(url, stream=True, timeout=(5, 15), headers=probe_h, allow_redirects=True)
+        if probe.status_code == 206 or probe.headers.get("Content-Range") or probe.headers.get("Accept-Ranges","").lower() == "bytes":
             upstream_accepts_ranges = True
+        try:
+            probe.close()
+        except Exception:
+            pass
     except requests.RequestException as e:
+        print(f"[relay] probe failed user={user_id} track={track_id} url={url} err={e}")
+
         print(f"[relay] probe failed user={user_id} track={track_id} url={url} err={e}")
 
     headers = dict(base_headers)
@@ -238,11 +248,26 @@ def relay(user_id: str, track_id: str, request: Request):
         upstream = (
             requests.head(url, timeout=(5, 15), headers=headers, allow_redirects=True)
             if request.method == "HEAD"
-            else requests.get(url, stream=True, timeout=(5, 300), headers=headers, allow_redirects=True)
+            else requests.get(url, stream=True, timeout=(5, 3600), headers=headers, allow_redirects=True)
         )
     except requests.RequestException as e:
         print(f"[relay] upstream error user={user_id} track={track_id} url={url} err={e}")
         raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
+    
+        # If client sent Range but upstream rejects it (416), retry once without Range.
+    if request.method == "GET" and upstream.status_code == 416 and client_range:
+        try:
+            no_range_headers = dict(base_headers)
+            upstream = requests.get(
+                url,
+                stream=True,
+                timeout=(5, 3600),
+                headers=no_range_headers,
+                allow_redirects=True,
+            )
+        except requests.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"Upstream retry (no-range) failed: {e}")
+
 
     status = upstream.status_code
     if status >= 400:
@@ -300,7 +325,7 @@ def relay(user_id: str, track_id: str, request: Request):
 
     return StreamingResponse(gen(), media_type=media, headers=passthrough, status_code=status)
 
-@router.api_route("/relay-mp3/{user_id}/{track_id}", methods=["GET", "HEAD"], name="relay_mp3")
+@router.api_route("/relay/{user_id}/{track_id}", methods=["GET", "HEAD"], name="relay_mp3")
 def relay_mp3(user_id: str, track_id: str, request: Request):
     lib = load_lib(user_id)
     track = lib["tracks"].get(track_id)
@@ -316,18 +341,12 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
             status_code=200,
             headers={
                 "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-store, must-revalidate",
-                "Connection": "close",
+                "Cache-Control": "no-store, must-revalidate, no-transform",
                 "Content-Type": "audio/mpeg",
                 "Accept-Ranges": "none",
-                "X-Accel-Buffering": "no",
-                "Content-Length": "0",
             },
         )
 
-    # IMPORTANT: ignore Range for live transcode (do not 416)
-    # (You can log it if you want)
-    # range_h = request.headers.get("range")
 
     cmd = _ffmpeg_cmd_for_http_input(url, abr_kbps=192)
     try:

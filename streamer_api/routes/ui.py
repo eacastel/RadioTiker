@@ -399,10 +399,27 @@ a1.addEventListener('error', () => {{
 }});
 
 // Autoplay next when finished
+let a1StartedAt = 0;
+let lastAutoAdvanceAt = 0;
+
+a1.addEventListener('playing', () => {{ a1StartedAt = Date.now(); }});
+
 a1.addEventListener('ended', () => {{
   const autoplay = document.getElementById('autoplay').checked;
-  if (autoplay) playNext();
+  if (!autoplay) return;
+
+  const now = Date.now();
+
+  // iOS bogus early-ended protection (common with chunked/live transcodes)
+  if (a1StartedAt && (now - a1StartedAt) < 8000) return;
+
+  // extra safety: don’t auto-advance twice within 2s
+  if (now - lastAutoAdvanceAt < 2000) return;
+  lastAutoAdvanceAt = now;
+  playNext();
+  setTimeout(() => a1.play().catch(() => {{}}), 0);
 }});
+
 
 // Agent status dot
 async function refreshStatus() {{
@@ -501,7 +518,7 @@ function pickIndex() {{
 }}
 
 function urlFor(tid) {{
-  return API + "/relay-mp3/" + userId + "/" + tid + "?v=" + libver();
+  return API + "/relay/" + userId + "/" + tid + "?v=" + libver();
 }}
 
 // Use a <source type="audio/mpeg"> to help stricter browsers
@@ -528,13 +545,19 @@ document.getElementById('btnNext').addEventListener('click', () => playNext());
 
 // Also allow the native ▶️ to kick the first track
 const audio = document.getElementById('player');
+
+let startedAt = 0;
+
+audio.addEventListener('playing', () => {{
+  startedAt = Date.now();
+}});
+
 function firstPlayKick() {{
   if (!audio.currentSrc || audio.currentSrc === "" || audio.currentSrc === window.location.href) {{
     playNext();
     setTimeout(() => audio.play().catch(() => {{}}), 0);
   }}
 }}
-audio.addEventListener('play', firstPlayKick);
 audio.addEventListener('click', firstPlayKick);
 audio.addEventListener('touchstart', firstPlayKick);
 
@@ -551,7 +574,14 @@ audio.addEventListener('error', () => {{
   console.error("[audio] error", audio.error, "src=", src);
   alert("Audio error. Could not load: " + src);
 }});
-audio.addEventListener('ended', () => playNext());
+let lastEndedAt = 0;
+
+audio.addEventListener('ended', () => {{
+  const now = Date.now();
+  // iOS bogus early-ended protection (unknown duration / chunked stream weirdness)
+  if (startedAt && (now - startedAt) < 8000) return;
+  playNext();
+}});
 
 // Agent status
 async function refreshStatus() {{

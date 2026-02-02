@@ -266,6 +266,10 @@ def relay(user_id: str, track_id: str, request: Request):
         raise HTTPException(status_code=503, detail="Agent offline or base_url/rel_path unknown")
 
     client_range = request.headers.get("range")
+
+    ua = request.headers.get("user-agent", "")
+    print(f"[relay] ua={ua!r} method={request.method} range={client_range!r} track={track_id}")
+
     base_headers = {"User-Agent": "RadioTiker-Relay/0.3"}
 
     # --- Probe upstream range capability (quick HEAD) ---
@@ -284,14 +288,10 @@ def relay(user_id: str, track_id: str, request: Request):
     headers = dict(base_headers)
     if request.method == "GET":
         if client_range:
-            headers["Range"] = client_range                         # honor client seek
-        elif upstream_accepts_ranges:
-            headers["Range"] = "bytes=0-"                           # coax 206 for playback
+            headers["Range"] = client_range
     else:  # HEAD
         if client_range:
             headers["Range"] = client_range
-        elif upstream_accepts_ranges:
-            headers["Range"] = "bytes=0-0"
 
     # --- Fetch upstream ---
     try:
@@ -316,15 +316,23 @@ def relay(user_id: str, track_id: str, request: Request):
 
     # --- Build response headers ---
     passthrough: Dict[str, str] = {}
-    for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Cache-Control", "ETag", "Last-Modified"]:
+    keys = ["Content-Type", "Content-Range", "Accept-Ranges", "Cache-Control", "ETag", "Last-Modified"]
+    if request.method == "HEAD" or client_range:
+        keys.insert(1, "Content-Length")
+
+    for k in keys:
         v = upstream.headers.get(k)
         if v:
             passthrough[k] = v
+            v = upstream.headers.get(k)
+            if v:
+                passthrough[k] = v
 
     # Always advertise byte serving to the browser
     passthrough.setdefault("Accept-Ranges", "bytes")
     # Ensure fresh after rescans
     passthrough.setdefault("Cache-Control", "no-store")
+    passthrough["Cache-Control"] = "no-store, no-transform"
 
     # If a range was requested (by client or by us) but upstream replied 200 without Content-Range,
     # synthesize a proper 206 with a full-range Content-Range header.
@@ -347,8 +355,13 @@ def relay(user_id: str, track_id: str, request: Request):
         for chunk in upstream.iter_content(chunk_size=256 * 1024):
             if chunk:
                 yield chunk
+                
+    print(f"[relay] -> status={status} cr={passthrough.get('Content-Range')} cl={passthrough.get('Content-Length')} ar={passthrough.get('Accept-Ranges')}")
 
     return StreamingResponse(gen(), media_type=media, headers=passthrough, status_code=status)
+
+    
+
 
 
 # ---------------- UI: full player ----------------
