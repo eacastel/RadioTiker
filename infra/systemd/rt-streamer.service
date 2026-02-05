@@ -1,0 +1,17 @@
+[Unit]
+Description=RadioTiker Streamer API (FastAPI/Uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=eacastel
+WorkingDirectory=/home/eacastel/RadioTiker/core/
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/eacastel/RadioTiker/core/streamer_api/.venv/bin/uvicorn streamer_api.main:app --host 127.0.0.1 --port 8090 --proxy-headers --root-path /streamer
+Restart=always
+RestartSec=2
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
