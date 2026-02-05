@@ -1,0 +1,143 @@
+server {
+	listen 443 ssl;
+        server_name radio.tiker.es radio.es www.radio.es;
+
+	root /var/www/radio.tiker.es/html;
+	index index.html;
+
+# Answer health directly from Nginx so brief app restarts don't look like 502
+    location = /streamer/api/health {
+        default_type application/json;
+        return 200 '{"ok":true}';
+    }
+
+
+
+location ^~ /streamer/api/relay-mp3/ {
+    proxy_pass         http://127.0.0.1:8090/api/relay-mp3/;
+    proxy_http_version 1.1;
+
+    proxy_set_header   Host $host;
+    proxy_set_header   X-Real-IP $remote_addr;
+    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+
+    # CRITICAL: do not forward Range probes to live transcode
+    proxy_set_header   Range $http_range;
+    proxy_set_header   If-Range $http_if_range;
+
+
+    proxy_request_buffering off;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    send_timeout 3600s;
+
+    proxy_set_header   Accept-Encoding "";
+
+    add_header Access-Control-Allow-Origin * always;
+    add_header Cache-Control "no-store, no-transform" always;
+}
+
+location /streamer/api/ {
+    proxy_pass         http://127.0.0.1:8090/api/;
+    proxy_http_version 1.1;
+
+    proxy_set_header   Host $host;
+    proxy_set_header   X-Real-IP $remote_addr;
+    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+
+    # Forward Range headers (OK even if your mp3 relay ignores ranges)
+    proxy_set_header   Range $http_range;
+    proxy_set_header   If-Range $http_if_range;
+
+    # Streaming essentials
+    proxy_request_buffering off;
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    send_timeout 3600s;
+
+    # Don't gzip proxied audio
+    proxy_set_header   Accept-Encoding "";
+
+    # iOS/mobile friendliness
+    add_header Access-Control-Allow-Origin * always;
+    add_header Cache-Control "no-store, no-transform" always;
+
+    # IMPORTANT: do NOT set Connection header here
+    # IMPORTANT: do NOT ignore X-Accel-Buffering
+}
+
+	location /streamer/ {
+		index thin-agent.html;
+		try_files $uri $uri/ =404;
+	}
+
+	location ~* \.(js|css|png|jpg|jpeg|gif|ico|woff|woff2|ttf|svg)$ {
+		expires 7d;
+		add_header Cache-Control "public, no-transform";
+	}
+
+	location /downloads/ {
+		autoindex on;
+		try_files $uri $uri/ =404;
+	}
+
+	location /stream/ {
+	proxy_pass         http://localhost:8000/;
+    proxy_http_version 1.1;
+    proxy_set_header   Connection "";
+
+    proxy_set_header   Host $host;
+    proxy_set_header   X-Real-IP $remote_addr;
+    proxy_set_header   X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header   X-Forwarded-Proto $scheme;
+
+    # mirror streaming essentials here too (if this serves audio)
+    proxy_set_header   Range $http_range;
+    proxy_set_header   If-Range $http_if_range;
+    proxy_request_buffering off;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    proxy_set_header   Accept-Encoding "";
+    add_header         Access-Control-Allow-Origin * always;
+	}
+    ssl_certificate /etc/letsencrypt/live/radio.tiker.es/fullchain.pem; # managed by Certbot
+    ssl_certificate_key /etc/letsencrypt/live/radio.tiker.es/privkey.pem; # managed by Certbot
+	include /etc/letsencrypt/options-ssl-nginx.conf; # managed by Certbot
+	ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # managed by Certbot
+
+
+}
+server {
+    if ($host = radio.tiker.es) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+
+    listen 80;
+    # IMPORTANT: Ensure ALL domains that need validation are listed here.
+    server_name radio.tiker.es radio.es www.radio.es; 
+
+    # Certbot challenge path: This ensures Let's Encrypt can always find 
+    # the temporary challenge files without redirection.
+    location /.well-known/acme-challenge/ {
+        # IMPORTANT: This must point to a location accessible by Certbot
+        # If you are using webroot, use the webroot path (e.g., /var/www/certbot)
+        # If you are using the nginx authenticator, Certbot handles this,
+        # but this simple block ensures no conflict.
+        try_files $uri =404;
+    }
+
+    # All other HTTP traffic is redirected to the HTTPS block above
+    location / {
+        return 301 https://$host$request_uri;
+    }
+
+
+}
