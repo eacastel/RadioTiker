@@ -259,8 +259,6 @@ def relay(user_id: str, track_id: str, request: Request):
     except requests.RequestException as e:
         print(f"[relay] probe failed user={user_id} track={track_id} url={url} err={e}")
 
-        print(f"[relay] probe failed user={user_id} track={track_id} url={url} err={e}")
-
     headers = dict(base_headers)
     if request.method == "GET":
         if client_range:
@@ -282,7 +280,7 @@ def relay(user_id: str, track_id: str, request: Request):
         print(f"[relay] upstream error user={user_id} track={track_id} url={url} err={e}")
         raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
     
-        # If client sent Range but upstream rejects it (416), retry once without Range.
+    # If client sent Range but upstream rejects it (416), retry once without Range.
     if request.method == "GET" and upstream.status_code == 416 and client_range:
         try:
             no_range_headers = dict(base_headers)
