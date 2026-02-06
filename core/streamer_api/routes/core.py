@@ -11,6 +11,34 @@ from ..utils import normalize_rel_path, build_stream_url
 
 router = APIRouter(prefix="/api", tags=["core"])
 
+def _probe_duration_sec(url: str) -> Optional[float]:
+    """
+    Best-effort duration probe for a remote media URL.
+    Returns seconds as float or None on failure.
+    """
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            url,
+        ]
+        out = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=12,
+            check=False,
+            text=True,
+        ).stdout.strip()
+        if not out:
+            return None
+        val = float(out)
+        return val if val > 0 else None
+    except Exception:
+        return None
+
 def _ffmpeg_cmd_for_http_input(url: str, abr_kbps: int = 192) -> list[str]:
     # 192 kbps CBR is a sweet spot for mobile/Bluetooth reliability.
     return [
@@ -336,19 +364,39 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
     if not url:
         raise HTTPException(status_code=503, detail="Agent offline or base_url/rel_path unknown")
 
+    # Best-effort duration (helps iOS display track length)
+    duration_sec: Optional[float] = None
+    try:
+        raw = track.get("duration_sec")
+        if raw:
+            duration_sec = float(raw)
+    except Exception:
+        duration_sec = None
+    if duration_sec is None:
+        duration_sec = _probe_duration_sec(url)
+
+    abr_kbps = 192
+    est_len = None
+    if duration_sec:
+        # Approximate size for CBR MP3: seconds * (kbps * 1000 / 8)
+        est_len = int(duration_sec * (abr_kbps * 1000 / 8))
+
     if request.method == "HEAD":
-        return Response(
-            status_code=200,
-            headers={
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-store, must-revalidate, no-transform",
-                "Content-Type": "audio/mpeg",
-                "Accept-Ranges": "none",
-            },
-        )
+        headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "no-store, must-revalidate, no-transform",
+            "Content-Type": "audio/mpeg",
+            "Accept-Ranges": "none",
+        }
+        if duration_sec:
+            headers["X-Content-Duration"] = str(duration_sec)
+            headers["Content-Duration"] = str(duration_sec)
+        if est_len:
+            headers["Content-Length"] = str(est_len)
+        return Response(status_code=200, headers=headers)
 
 
-    cmd = _ffmpeg_cmd_for_http_input(url, abr_kbps=192)
+    cmd = _ffmpeg_cmd_for_http_input(url, abr_kbps=abr_kbps)
     try:
         p = subprocess.Popen(
             cmd,
@@ -378,5 +426,10 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
         "Accept-Ranges": "none",
         "X-Accel-Buffering": "no",
     }
+    if duration_sec:
+        headers["X-Content-Duration"] = str(duration_sec)
+        headers["Content-Duration"] = str(duration_sec)
+    if est_len:
+        headers["Content-Length"] = str(est_len)
 
     return StreamingResponse(gen(), media_type="audio/mpeg", headers=headers)
