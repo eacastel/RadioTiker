@@ -325,7 +325,7 @@ def relay(user_id: str, track_id: str, request: Request):
 
     return StreamingResponse(gen(), media_type=media, headers=passthrough, status_code=status)
 
-@router.api_route("/relay/{user_id}/{track_id}", methods=["GET", "HEAD"], name="relay_mp3")
+@router.api_route("/relay-mp3/{user_id}/{track_id}", methods=["GET", "HEAD"], name="relay_mp3")
 def relay_mp3(user_id: str, track_id: str, request: Request):
     lib = load_lib(user_id)
     track = lib["tracks"].get(track_id)
@@ -380,4 +380,3 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
     }
 
     return StreamingResponse(gen(), media_type="audio/mpeg", headers=headers)
-
