@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>RadioTiker vNext</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0b1020;
+      color: #e5e7eb;
+    }
+    .card {
+      max-width: 720px;
+      margin: 24px auto;
+      padding: 20px;
+      border: 1px solid #374151;
+      border-radius: 12px;
+      background: #111827;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+    p {
+      margin: 8px 0 16px;
+      color: #cbd5e1;
+    }
+    a {
+      color: #93c5fd;
+      text-decoration: none;
+    }
+    a:hover { text-decoration: underline; }
+    ul {
+      margin: 0;
+      padding-left: 20px;
+      line-height: 1.8;
+    }
+    code {
+      background: #1f2937;
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>RadioTiker vNext</h1>
+    <p>Thin Agent downloads for device onboarding.</p>
+    <ul>
+      <li>
+        Linux x86_64:
+        <a href="https://radio.tiker.es/downloads/radiotiker-thin-agent-latest-linux">
+          radiotiker-thin-agent-latest-linux
+        </a>
+      </li>
+      <li>
+        ARM32 (Raspberry Pi):
+        <a href="https://radio.tiker.es/downloads/radiotiker-thin-agent-latest-arm32">
+          radiotiker-thin-agent-latest-arm32
+        </a>
+      </li>
+      <li>
+        API health:
+        <a href="/streamer/api/health">/streamer/api/health</a>
+      </li>
+    </ul>
+    <p style="margin-top:16px">
+      After download, run onboarding with:
+      <code>./onboard_and_start.sh --user-id &lt;user&gt; --library-path &lt;path&gt; --run</code>
+    </p>
+  </div>
+</body>
+</html>

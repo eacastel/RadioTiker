@@ -3,7 +3,6 @@ import json, time, requests
 import os, subprocess, re
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, Response
-from starlette.background import BackgroundTask
 from ..models import ScanPayload, AnnouncePayload
 from ..storage import load_lib, save_lib, load_agent, save_agent_stable
 from ..utils import normalize_rel_path, build_stream_url
@@ -302,6 +301,10 @@ def relay(user_id: str, track_id: str, request: Request):
             body_preview = upstream.text[:400]
         except Exception:
             pass
+        try:
+            upstream.close()
+        except Exception:
+            pass
         print(f"[relay] upstream HTTP {status} user={user_id} track={track_id} url={url} body={body_preview!r}")
         raise HTTPException(status_code=status, detail=f"Upstream returned {status}")
 
@@ -320,6 +323,10 @@ def relay(user_id: str, track_id: str, request: Request):
 
     # If it's FLAC, don't risk it: many browsers choke on FLAC-with-picture streams.
     if media_lc.startswith("audio/flac") or media_lc.startswith("audio/x-flac"):
+        try:
+            upstream.close()
+        except Exception:
+            pass
         target_url = str(request.url_for("relay_mp3", user_id=user_id, track_id=track_id))
         if request.url.query:
             target_url = f"{target_url}?{request.url.query}"
@@ -334,6 +341,10 @@ def relay(user_id: str, track_id: str, request: Request):
     )
 
     if not IOS_OK:
+        try:
+            upstream.close()
+        except Exception:
+            pass
         target_url = str(request.url_for("relay_mp3", user_id=user_id, track_id=track_id))
         if request.url.query:
             target_url = f"{target_url}?{request.url.query}"
@@ -342,12 +353,22 @@ def relay(user_id: str, track_id: str, request: Request):
         # ---- end auto-switch ----
 
     if request.method == "HEAD":
+        try:
+            upstream.close()
+        except Exception:
+            pass
         return Response(status_code=status, headers=passthrough, media_type=media)
 
     def gen():
-        for chunk in upstream.iter_content(chunk_size=256 * 1024):
-            if chunk:
-                yield chunk
+        try:
+            for chunk in upstream.iter_content(chunk_size=256 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
 
     return StreamingResponse(gen(), media_type=media, headers=passthrough, status_code=status)
 
@@ -427,7 +448,7 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
     if duration_sec:
         headers["X-Content-Duration"] = str(duration_sec)
         headers["Content-Duration"] = str(duration_sec)
-    if est_len:
-        headers["Content-Length"] = str(est_len)
+    # Do not set guessed Content-Length on live transcode GET responses.
+    # Estimated lengths can cause premature end behavior on some clients.
 
     return StreamingResponse(gen(), media_type="audio/mpeg", headers=headers)

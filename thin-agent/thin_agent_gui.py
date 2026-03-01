@@ -1,6 +1,6 @@
 # thin_agent_gui.py
 
-import os, time, threading, hashlib, json
+import os, time, threading, hashlib, json, re
 from pathlib import Path
 from dotenv import load_dotenv
 from mutagen import File as MutagenFile
@@ -12,6 +12,7 @@ from tkinter import filedialog, scrolledtext, messagebox, Toplevel, Label
 from urllib.parse import urljoin
 
 from local_file_server import LocalFileServer
+from tunnel_manager import start_tunnel_from_env
 
 APP_NAME = "RadioTiker Thin Agent"
 APP_VERSION = "0.3"
@@ -123,6 +124,70 @@ def _duration_seconds(path: str):
     except Exception:
         return None
 
+def _first_tag(audio, key: str, default=None):
+    if not audio:
+        return default
+    try:
+        vals = audio.get(key)
+        if not vals:
+            return default
+        val = vals[0]
+        return str(val).strip() if val is not None else default
+    except Exception:
+        return default
+
+def _parse_first_int(value) -> int | None:
+    if value is None:
+        return None
+    m = re.search(r"\d+", str(value))
+    if not m:
+        return None
+    try:
+        return int(m.group(0))
+    except Exception:
+        return None
+
+def _parse_float(value) -> float | None:
+    if value is None:
+        return None
+    m = re.search(r"\d+(\.\d+)?", str(value))
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except Exception:
+        return None
+
+def _codec_from_path(path: str) -> str | None:
+    ext = os.path.splitext(path)[1].lower().lstrip(".")
+    return ext or None
+
+def _technical_info(path: str):
+    codec = _codec_from_path(path)
+    sample_rate = None
+    bit_depth = None
+    bitrate_kbps = None
+    channels = None
+    try:
+        mf = MutagenFile(path)
+        info = getattr(mf, "info", None) if mf else None
+        if info:
+            sr = getattr(info, "sample_rate", None)
+            if isinstance(sr, int) and sr > 0:
+                sample_rate = sr
+            bd = getattr(info, "bits_per_sample", None)
+            if isinstance(bd, int) and bd > 0:
+                bit_depth = bd
+            br = getattr(info, "bitrate", None)
+            if isinstance(br, int) and br > 0:
+                bitrate_kbps = int(round(br / 1000))
+            ch = getattr(info, "channels", None)
+            if isinstance(ch, int) and ch > 0:
+                channels = ch
+    except Exception:
+        pass
+    return codec, sample_rate, bit_depth, bitrate_kbps, channels
+
 def announce_agent(user_id: str, base_url: str, log_fn):
     payload = {"user_id": user_id, "base_url": base_url}
     try:
@@ -151,10 +216,19 @@ def scan_folder(folder_path, log_fn):
                 size, mtime = _file_fingerprint(full_path)
 
                 easy = MutagenFile(full_path, easy=True)
-                title  = (easy.get("title",  [os.path.splitext(fname)[0]]) or [None])[0] if easy else os.path.splitext(fname)[0]
-                artist = (easy.get("artist", ["Unknown"])              or ["Unknown"])[0] if easy else "Unknown"
-                album  = (easy.get("album",  ["Unknown"])              or ["Unknown"])[0] if easy else "Unknown"
-
+                title_default = os.path.splitext(fname)[0]
+                title = _first_tag(easy, "title", title_default)
+                artist = _first_tag(easy, "artist", "Unknown")
+                album = _first_tag(easy, "album", "Unknown")
+                album_artist = _first_tag(easy, "albumartist")
+                genre = _first_tag(easy, "genre")
+                year = _parse_first_int(_first_tag(easy, "date"))
+                track_no = _parse_first_int(_first_tag(easy, "tracknumber"))
+                disc_no = _parse_first_int(_first_tag(easy, "discnumber"))
+                composer = _first_tag(easy, "composer")
+                bpm = _parse_float(_first_tag(easy, "bpm"))
+                musical_key = _first_tag(easy, "initialkey") or _first_tag(easy, "key")
+                codec, sample_rate, bit_depth, bitrate_kbps, channels = _technical_info(full_path)
                 dur = _duration_seconds(full_path)
                 rel = os.path.relpath(full_path, folder_path).replace(os.sep, "/")
 
@@ -162,6 +236,19 @@ def scan_folder(folder_path, log_fn):
                     "title": title,
                     "artist": artist,
                     "album": album,
+                    "album_artist": album_artist,
+                    "genre": genre,
+                    "year": year,
+                    "track_no": track_no,
+                    "disc_no": disc_no,
+                    "composer": composer,
+                    "bpm": bpm,
+                    "musical_key": musical_key,
+                    "codec": codec,
+                    "sample_rate": sample_rate,
+                    "bit_depth": bit_depth,
+                    "bitrate_kbps": bitrate_kbps,
+                    "channels": channels,
                     "path": full_path,
                     "rel_path": rel,
                     "file_size": size,
@@ -237,6 +324,7 @@ class AgentGUI:
 
         # single pattern: keep a direct reference to the server
         self.file_server = None
+        self.tunnel = None
         self._hb_stop = None  # heartbeat stopper
 
         row = 0
@@ -323,7 +411,7 @@ class AgentGUI:
             self.path_var.set(folder)
 
     # ----------------- server lifecycle -----------------
-    def _start_local_server(self, path: str) -> str:
+    def _start_local_server(self, path: str, public_base_url: str | None = None) -> str:
         if self.file_server:
             # restart on same/different path (cheap)
             try:
@@ -332,7 +420,8 @@ class AgentGUI:
                 pass
             self.file_server = None
 
-        self.file_server = LocalFileServer(root_dir=path, port=DEFAULT_PORT, public_base_url=PUBLIC_BASE_URL)
+        base_override = public_base_url if public_base_url is not None else PUBLIC_BASE_URL
+        self.file_server = LocalFileServer(root_dir=path, port=DEFAULT_PORT, public_base_url=base_override)
         self.file_server.start()
         base = self.file_server.base_url()
         self.log(f"📡 Local file server: {base}\n")
@@ -344,6 +433,9 @@ class AgentGUI:
             if self.file_server:
                 self.file_server.stop()
                 self.file_server = None
+            if self.tunnel:
+                self.tunnel.stop()
+                self.tunnel = None
         except Exception:
             pass
 
@@ -360,7 +452,9 @@ class AgentGUI:
         self._set_led(tailscale_ok())
 
         try:
-            base = self._start_local_server(path)
+            # Start reverse tunnel if enabled (best-effort)
+            self.tunnel, tunnel_base = start_tunnel_from_env(DEFAULT_PORT, log_fn=self.log)
+            base = self._start_local_server(path, public_base_url=tunnel_base)
             announce_agent(USER_ID, base, self.log)
             self._start_heartbeat(base)
             _remember_root(path)

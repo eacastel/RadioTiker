@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Iterable
 import json, time
 
 # radio-tiker-core/  (two levels up from this file)
@@ -59,3 +59,40 @@ def save_agent_stable(user_id: str, st: Dict[str, Any]):
     stable = {"base_url": st.get("base_url")}
     AGENTS[user_id] = {**st}
     agent_path(user_id).write_text(_json.dumps(stable, indent=2))
+
+def save_agent_record(user_id: str, st: Dict[str, Any]):
+    """
+    Persist agent record with tunnel details (vnext).
+    """
+    import json as _json
+    stable = {
+        "base_url": st.get("base_url"),
+        "agent_id": st.get("agent_id"),
+        "public_key": st.get("public_key"),
+        "ssh_host": st.get("ssh_host"),
+        "ssh_user": st.get("ssh_user"),
+        "remote_port": st.get("remote_port"),
+        "local_port": st.get("local_port"),
+        "last_scan": st.get("last_scan"),
+    }
+    AGENTS[user_id] = {**st}
+    agent_path(user_id).write_text(_json.dumps(stable, indent=2))
+
+def list_assigned_ports() -> Iterable[int]:
+    """
+    Read all saved agent records and return any assigned remote ports.
+    """
+    ports = []
+    for p in DATA_DIR.glob("*.agent.json"):
+        try:
+            obj = json.loads(p.read_text())
+            rp = obj.get("remote_port")
+            if isinstance(rp, int):
+                ports.append(rp)
+        except Exception:
+            continue
+    for st in AGENTS.values():
+        rp = st.get("remote_port")
+        if isinstance(rp, int):
+            ports.append(rp)
+    return ports

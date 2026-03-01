@@ -6,6 +6,29 @@ This monorepo consolidates:
 - **core/**: Server-side streamer API (FastAPI/Uvicorn), library storage, relay/transcode endpoints
 - **thin-agent/**: Thin agent that scans local music folders and serves files to the streamer via a local file server; also supports packaging binaries (PyInstaller)
 
+## Product Vision (Working Draft)
+
+RadioTiker aims to be a self-hosted, Plex-like music platform:
+1. User signs up.
+2. User installs a thin agent on their device or NAS.
+3. Agent scans local folders and announces a file server URL.
+4. Server indexes metadata and serves streams to the user.
+5. User can browse, play, and administer their library from the web UI.
+
+Today, remote connectivity may use a tunnel (Tailscale) or a port-forward.
+Future goal is a simple "turn it on and it works" agent with no manual network setup.
+
+## Docs
+
+See:
+- `INSTRUCTIONS.md` for ops and build notes.
+- `docs/OVERVIEW.md` for onboarding and network model (draft).
+- `docs/ROADMAP.md` for milestone plan and delivery gates.
+- `docs/REVERSE_TUNNEL.md` for the Phase 1 SSH reverse tunnel design.
+- `docs/ONBOARDING.md` for device linking and plan gating.
+- `docs/DB_SCHEMA.md` for the initial PostgreSQL schema.
+- `docs/ANALYSIS_PIPELINE.md` for server-side health checks and normalization.
+
 ## Repository Layout
 
 - `core/`

@@ -444,6 +444,70 @@ updateSortArrows();
 </html>"""
     return HTMLResponse(html, status_code=200)
 
+# ---------------- UI: device link ----------------
+@router.get("/link/{device_code}", response_class=HTMLResponse)
+def link_device(device_code: str):
+    html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>RadioTiker — Link Device</title>
+<style>
+  body{{font-family:system-ui,Segoe UI,Roboto,Arial;margin:0;background:#fafafa}}
+  .wrap{{max-width:640px;margin:40px auto;background:#fff;border:1px solid #eee;border-radius:8px;padding:20px}}
+  label{{display:block;margin:12px 0 4px}}
+  input,select,button{{font-size:16px;padding:8px 10px}}
+  button{{margin-top:16px}}
+  .muted{{color:#666;font-size:14px}}
+  .code{{font-family:monospace;font-size:18px}}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h2>Link your device</h2>
+    <div class="muted">Device code:</div>
+    <div class="code">{device_code}</div>
+
+    <label for="user_id">User ID</label>
+    <input id="user_id" placeholder="your-user-id" />
+
+    <label for="plan">Plan</label>
+    <select id="plan">
+      <option value="free">Free</option>
+      <option value="pro">Pro</option>
+    </select>
+
+    <button onclick="linkDevice()">Approve device</button>
+    <div id="status" class="muted"></div>
+  </div>
+
+<script>
+async function linkDevice() {{
+  const userId = document.getElementById('user_id').value.trim();
+  if (!userId) {{
+    alert('Enter your user id');
+    return;
+  }}
+  const res = await fetch('/streamer/api/agent/link/complete', {{
+    method: 'POST',
+    headers: {{ 'Content-Type': 'application/json' }},
+    body: JSON.stringify({{ device_code: '{device_code}', user_id: userId }})
+  }});
+  const status = document.getElementById('status');
+  if (!res.ok) {{
+    const t = await res.text();
+    status.textContent = 'Error: ' + t;
+    return;
+  }}
+  const j = await res.json();
+  status.textContent = 'Linked. Agent token issued.';
+}}
+</script>
+</body>
+</html>"""
+    return HTMLResponse(html, status_code=200)
+
 # ---------------- UI: tiny radio page ----------------
 @router.get("/radio/{user_id}", response_class=HTMLResponse)
 def radio_page(user_id: str):

@@ -2,6 +2,9 @@
 
 This doc is the “how to run it” reference for the RadioTiker monorepo.
 
+See `docs/OVERVIEW.md` for product flow and network model (draft).
+See `docs/REVERSE_TUNNEL.md` for the Phase 1 SSH reverse tunnel design.
+
 ## Monorepo Paths (important)
 
 - Core server code: `~/RadioTiker/core`
@@ -198,6 +201,27 @@ Optional: update "latest" aliases
 
 Download URLs:
 - https://radio.tiker.es/downloads/radiotiker-thin-agent-v0.4-linux
+
+---
+
+## User Onboarding (Current)
+
+1. User signs up on the server.
+2. User downloads the thin agent binary for their OS.
+3. User runs the agent and selects one or more folders to scan.
+4. Agent announces its local file server URL to the server.
+5. Server indexes tracks and serves playback from the UI.
+
+## Network Model (Current)
+
+The server must be able to reach the agent's local file server.
+
+Supported today:
+1. Tailscale between user network and Hetzner.
+2. Port forwarding from the user's router to the agent.
+3. Manual VPN or reverse proxy.
+
+Target model is a single "turn it on and it works" path, likely a reverse tunnel or managed tunnel service.
 - https://radio.tiker.es/downloads/radiotiker-thin-agent-v0.4-arm32
 - https://radio.tiker.es/downloads/radiotiker-thin-agent-latest-linux
 - https://radio.tiker.es/downloads/radiotiker-thin-agent-latest-arm32

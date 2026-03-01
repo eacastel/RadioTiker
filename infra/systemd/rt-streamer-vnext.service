@@ -1,0 +1,15 @@
+[Unit]
+Description=RadioTiker Streamer API (vnext)
+After=network.target
+
+[Service]
+Type=simple
+User=eacastel
+WorkingDirectory=/home/eacastel/RadioTiker-vnext/core
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/eacastel/RadioTiker-vnext/core/streamer_api/.venv/bin/python -m uvicorn streamer_api.main:app --host 127.0.0.1 --port 8091 --proxy-headers --root-path /streamer
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
