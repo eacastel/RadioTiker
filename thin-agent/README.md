@@ -52,3 +52,31 @@ To start immediately after onboarding:
   --library-path /path/to/Music \
   --run
 ```
+
+In the GUI agent, use `Open Library` to launch the browser player at:
+`https://next.radio.tiker.es/streamer/api/user/<user>/play`
+
+By default the script also installs a Linux user auto-start service:
+By default the script runs in temporary mode (no persistent service).
+
+To enable Linux user auto-start service explicitly:
+
+```bash
+./onboard_and_start.sh --user-id eacastel --library-path /path/to/Music --autostart
+```
+
+Auto-start files:
+1. `~/.config/systemd/user/radiotiker-vnext-agent.service`
+2. `~/.config/radiotiker-vnext/agent.env`
+
+## Publish vNext Thin Distribution (binary + onboard script)
+
+On Hetzner (from this folder):
+
+```bash
+./build_and_publish_vnext_thin.sh v0.5
+```
+
+This publishes:
+1. `radiotiker-thin-agent-vnext-latest-linux` (binary)
+2. `radiotiker-vnext-onboard-latest.sh` (helper script)

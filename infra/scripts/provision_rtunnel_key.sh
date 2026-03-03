@@ -67,12 +67,14 @@ TMP_FILE="$(mktemp)"
 trap 'rm -f "$TMP_FILE"' EXIT
 
 if [[ -s "$AUTH_KEYS" ]]; then
-  grep -v "$MARKER" "$AUTH_KEYS" > "$TMP_FILE" || true
+  # Remove previous entries for this marker and this exact key blob
+  # so old restrictive options can't shadow the new entry.
+  grep -v "$MARKER" "$AUTH_KEYS" | grep -v " ${KEY_BLOB} " > "$TMP_FILE" || true
 else
   : > "$TMP_FILE"
 fi
 
-OPTS="no-pty,no-user-rc,no-X11-forwarding,no-agent-forwarding,permitlisten=\"127.0.0.1:${REMOTE_PORT}\""
+OPTS="no-pty,no-user-rc,no-X11-forwarding,no-agent-forwarding,permitlisten=\"localhost:${REMOTE_PORT}\""
 echo "${OPTS} ${KEY_TYPE} ${KEY_BLOB} ${MARKER}" >> "$TMP_FILE"
 
 install -m 600 -o rtunnel -g rtunnel "$TMP_FILE" "$AUTH_KEYS"

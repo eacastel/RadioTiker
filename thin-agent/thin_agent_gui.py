@@ -1,11 +1,12 @@
 # thin_agent_gui.py
 
-import os, time, threading, hashlib, json, re
+import os, time, threading, hashlib, json, re, shutil
 from pathlib import Path
 from dotenv import load_dotenv
 from mutagen import File as MutagenFile
 import requests
 import subprocess
+import webbrowser
 
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox, Toplevel, Label
@@ -20,7 +21,7 @@ APP_VERSION = "0.3"
 load_dotenv()
 
 # --- API endpoints (proxied via NGINX) ---
-API_BASE    = os.getenv("SERVER_BASE", "https://radio.tiker.es/streamer/api/")
+API_BASE    = os.getenv("SERVER_BASE", "https://next.radio.tiker.es/streamer/api/")
 SUBMIT_URL  = urljoin(API_BASE, "submit-scan")
 ANNOUNCE_URL= urljoin(API_BASE, "agent/announce")
 
@@ -75,6 +76,7 @@ VALID_EXTENSIONS = tuple(
 )
 DEFAULT_PORT     = int(os.getenv("AGENT_PORT", "8765"))
 PUBLIC_BASE_URL  = os.getenv("PUBLIC_BASE_URL")  # optional tunnel override
+ENABLE_ACOUSTID_SCAN = str(os.getenv("ENABLE_ACOUSTID_SCAN", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 # ---------- identity ----------
 def get_user_id_interactive(default_val="user-001"):
@@ -188,6 +190,42 @@ def _technical_info(path: str):
         pass
     return codec, sample_rate, bit_depth, bitrate_kbps, channels
 
+
+def _acoustid_fingerprint(path: str):
+    if not ENABLE_ACOUSTID_SCAN:
+        return None, None
+    exe = shutil.which("fpcalc")
+    if not exe:
+        return None, None
+    try:
+        p = subprocess.run([exe, "-json", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, text=True, check=False)
+        out = (p.stdout or "").strip()
+        if out.startswith("{"):
+            j = json.loads(out)
+            fp = str(j.get("fingerprint") or "").strip()
+            dur = float(j.get("duration")) if j.get("duration") is not None else None
+            if fp:
+                return fp, dur
+    except Exception:
+        pass
+    try:
+        p = subprocess.run([exe, path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, text=True, check=False)
+        fp = None
+        dur = None
+        for ln in (p.stdout or "").splitlines():
+            if ln.startswith("FINGERPRINT="):
+                fp = ln.split("=", 1)[1].strip()
+            elif ln.startswith("DURATION="):
+                try:
+                    dur = float(ln.split("=", 1)[1].strip())
+                except Exception:
+                    dur = None
+        if fp:
+            return fp, dur
+    except Exception:
+        pass
+    return None, None
+
 def announce_agent(user_id: str, base_url: str, log_fn):
     payload = {"user_id": user_id, "base_url": base_url}
     try:
@@ -196,11 +234,14 @@ def announce_agent(user_id: str, base_url: str, log_fn):
     except Exception as e:
         log_fn(f"❌ Announce failed: {e}\n")
 
-def scan_folder(folder_path, log_fn):
+def scan_folder(folder_path, log_fn, stop_event: threading.Event | None = None):
     lib = []
     # pre-count (nice progress)
     total = 0
     for root, _, files in os.walk(folder_path):
+        if stop_event and stop_event.is_set():
+            log_fn("⚠️ Scan cancelled.\n")
+            return lib
         for fname in files:
             if fname.lower().endswith(VALID_EXTENSIONS):
                 total += 1
@@ -208,7 +249,13 @@ def scan_folder(folder_path, log_fn):
     count = 0
     log_fn(f"Scanning folder: {folder_path}\nTotal candidates: {total}\n")
     for root, _, files in os.walk(folder_path):
+        if stop_event and stop_event.is_set():
+            log_fn("⚠️ Scan cancelled.\n")
+            return lib
         for fname in files:
+            if stop_event and stop_event.is_set():
+                log_fn("⚠️ Scan cancelled.\n")
+                return lib
             if not fname.lower().endswith(VALID_EXTENSIONS):
                 continue
             full_path = os.path.join(root, fname)
@@ -230,6 +277,7 @@ def scan_folder(folder_path, log_fn):
                 musical_key = _first_tag(easy, "initialkey") or _first_tag(easy, "key")
                 codec, sample_rate, bit_depth, bitrate_kbps, channels = _technical_info(full_path)
                 dur = _duration_seconds(full_path)
+                acoustid_fp, acoustid_dur = _acoustid_fingerprint(full_path)
                 rel = os.path.relpath(full_path, folder_path).replace(os.sep, "/")
 
                 lib.append({
@@ -254,6 +302,8 @@ def scan_folder(folder_path, log_fn):
                     "file_size": size,
                     "mtime": mtime,
                     "duration_sec": dur,
+                    "acoustid_fingerprint": acoustid_fp,
+                    "acoustid_duration": acoustid_dur,
                     "track_id": _track_id(full_path, size, mtime),
                 })
                 count += 1
@@ -263,13 +313,23 @@ def scan_folder(folder_path, log_fn):
                 log_fn(f"❌ {full_path}: {e}\n")
     return lib
 
-def send_in_batches(user_id: str, tracks: list, log_fn, batch_size=300, replace=False):
+def send_in_batches(
+    user_id: str,
+    tracks: list,
+    log_fn,
+    batch_size=300,
+    replace=False,
+    stop_event: threading.Event | None = None,
+):
     if not tracks:
         log_fn("Nothing to send.\n")
         return
     version = int(time.time())
     total = len(tracks)
     for i in range(0, total, batch_size):
+        if stop_event and stop_event.is_set():
+            log_fn("⚠️ Upload cancelled.\n")
+            break
         chunk = tracks[i:i+batch_size]
         payload = {
             "user_id": user_id,
@@ -326,6 +386,8 @@ class AgentGUI:
         self.file_server = None
         self.tunnel = None
         self._hb_stop = None  # heartbeat stopper
+        self._scan_thread = None
+        self._scan_stop = None
 
         row = 0
         # user label inside the app
@@ -342,9 +404,11 @@ class AgentGUI:
         tk.Button(root, text="Browse", command=self.browse).grid(row=row, column=2, padx=4)
         row += 1
 
-        # Scan button
-        self.btn = tk.Button(root, text="Scan and Send", command=self.scan_and_send)
-        self.btn.grid(row=row, column=0, columnspan=3, pady=8, sticky="w")
+        # Actions
+        self.btn_scan = tk.Button(root, text="Scan and Send", command=self.scan_and_send)
+        self.btn_scan.grid(row=row, column=0, pady=8, sticky="w", padx=(10, 6))
+        self.btn_open = tk.Button(root, text="Open Library", command=self.open_library)
+        self.btn_open.grid(row=row, column=1, pady=8, sticky="w")
         row += 1
 
         # Log window
@@ -410,6 +474,14 @@ class AgentGUI:
         if folder:
             self.path_var.set(folder)
 
+    def open_library(self):
+        play_url = urljoin(API_BASE, f"user/{USER_ID}/play")
+        try:
+            webbrowser.open(play_url)
+            self.log(f"🌐 Opened library: {play_url}\n")
+        except Exception as e:
+            self.log(f"❌ Could not open browser: {e}\n")
+
     # ----------------- server lifecycle -----------------
     def _start_local_server(self, path: str, public_base_url: str | None = None) -> str:
         if self.file_server:
@@ -422,10 +494,21 @@ class AgentGUI:
 
         base_override = public_base_url if public_base_url is not None else PUBLIC_BASE_URL
         self.file_server = LocalFileServer(root_dir=path, port=DEFAULT_PORT, public_base_url=base_override)
-        self.file_server.start()
-        base = self.file_server.base_url()
-        self.log(f"📡 Local file server: {base}\n")
-        return base
+        try:
+            self.file_server.start()
+            base = self.file_server.base_url()
+            self.log(f"📡 Local file server: {base}\n")
+            return base
+        except OSError as e:
+            # Dev-safe behavior: if another agent already owns the port, reuse it.
+            if getattr(e, "errno", None) == 98:
+                existing_base = base_override or f"http://127.0.0.1:{DEFAULT_PORT}"
+                self.log(
+                    f"⚠️ Port {DEFAULT_PORT} already in use. Reusing existing local server at {existing_base}\n"
+                )
+                self.file_server = None
+                return existing_base
+            raise
 
     def stop_server(self):
         try:
@@ -440,6 +523,8 @@ class AgentGUI:
             pass
 
     def on_close(self):
+        if self._scan_stop:
+            self._scan_stop.set()
         self.stop_server()
         self.root.destroy()
 
@@ -464,6 +549,17 @@ class AgentGUI:
             self.log(f"❌ Could not start local file server: {e}\n")
 
     def scan_and_send(self):
+        # Prevent overlapping scans that interleave progress and corrupt UX.
+        if self._scan_thread and self._scan_thread.is_alive():
+            if not messagebox.askyesno(
+                "Scan already running",
+                "A scan/upload is already running.\n\nStop it and start a new one?",
+            ):
+                return
+            if self._scan_stop:
+                self._scan_stop.set()
+            self.log("⚠️ Requested stop of current scan. Starting new scan...\n")
+
         path = self.path_var.get()
         if not os.path.isdir(path):
             messagebox.showerror("Error", "Invalid folder path")
@@ -507,16 +603,41 @@ class AgentGUI:
             self.log(f"❌ Could not start local file server: {e}\n")
             return
 
+        self._scan_stop = threading.Event()
+
+        self.btn_scan.config(state="disabled")
+        self.status_var.set("Status: scanning...")
+
         def work():
-            tracks = scan_folder(path, self.log)
-            self.log(f"🎵 Found {len(tracks)} valid audio files.\n")
-            _remember_root(path)
+            try:
+                tracks = scan_folder(path, self.log, stop_event=self._scan_stop)
+                if self._scan_stop and self._scan_stop.is_set():
+                    self.status_var.set("Status: scan cancelled")
+                    return
 
-            # Send in batches; only the FIRST batch includes replace=True when requested
-            send_in_batches(USER_ID, tracks, self.log, batch_size=500, replace=replacing)
-            self.status_var.set("Status: connected (scanned)")
+                self.log(f"🎵 Found {len(tracks)} valid audio files.\n")
+                _remember_root(path)
 
-        threading.Thread(target=work, daemon=True).start()
+                # Send in batches; only the FIRST batch includes replace=True when requested
+                send_in_batches(
+                    USER_ID,
+                    tracks,
+                    self.log,
+                    batch_size=500,
+                    replace=replacing,
+                    stop_event=self._scan_stop,
+                )
+                if self._scan_stop and self._scan_stop.is_set():
+                    self.status_var.set("Status: upload cancelled")
+                else:
+                    self.status_var.set("Status: connected (scanned)")
+            finally:
+                self.root.after(0, lambda: self.btn_scan.config(state="normal"))
+                self._scan_stop = None
+                self._scan_thread = None
+
+        self._scan_thread = threading.Thread(target=work, daemon=True)
+        self._scan_thread.start()
 
 # ---------- headless ----------
 def run_headless():

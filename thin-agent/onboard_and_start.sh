@@ -22,6 +22,8 @@ Options:
   --device-name <name>    Device name shown in onboarding (default: hostname)
   --key-path <path>       SSH private key path (default: ~/.radiotiker/agent_ed25519)
   --env-file <path>       Output env file (default: ./.env)
+  --agent-bin <path>      Agent binary path (default: ./radiotiker-thin-agent-vnext-latest-linux)
+  --autostart             Install/update systemd user auto-start service (opt-in)
   --run                   Start thin_agent.py after writing env
   --help                  Show this help
 EOF
@@ -34,6 +36,8 @@ AGENT_PORT="8765"
 DEVICE_NAME="$(hostname)"
 KEY_PATH="${HOME}/.radiotiker/agent_ed25519"
 ENV_FILE=".env"
+AGENT_BIN="./radiotiker-thin-agent-vnext-latest-linux"
+INSTALL_AUTOSTART=0
 RUN_AFTER=0
 
 while [[ $# -gt 0 ]]; do
@@ -45,6 +49,8 @@ while [[ $# -gt 0 ]]; do
     --device-name) DEVICE_NAME="${2:-}"; shift 2 ;;
     --key-path) KEY_PATH="${2:-}"; shift 2 ;;
     --env-file) ENV_FILE="${2:-}"; shift 2 ;;
+    --agent-bin) AGENT_BIN="${2:-}"; shift 2 ;;
+    --autostart) INSTALL_AUTOSTART=1; shift 1 ;;
     --run) RUN_AFTER=1; shift 1 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
@@ -68,7 +74,7 @@ fi
 
 json_field() {
   local field="$1"
-  python3 - "$field" <<'PY'
+  python3 -c '
 import json,sys
 field = sys.argv[1]
 obj = json.load(sys.stdin)
@@ -82,7 +88,83 @@ for part in field.split("."):
 if cur is None:
     sys.exit(1)
 print(cur)
-PY
+' "$field"
+}
+
+is_json() {
+  python3 -c 'import json,sys; json.load(sys.stdin)'
+}
+
+post_json_checked() {
+  local url="$1"
+  local payload="$2"
+  local resp status body
+  resp="$(curl -sS -w $'\n%{http_code}' -X POST "${url}" \
+    -H 'Content-Type: application/json' \
+    -d "${payload}")"
+  status="$(printf '%s' "${resp}" | tail -n 1)"
+  body="$(printf '%s' "${resp}" | sed '$d')"
+  if [[ "${status}" != "200" ]]; then
+    echo "Request failed: POST ${url} -> HTTP ${status}" >&2
+    echo "Response body:" >&2
+    echo "${body}" >&2
+    exit 1
+  fi
+  if ! printf '%s' "${body}" | is_json >/dev/null 2>&1; then
+    echo "Request failed: POST ${url} returned non-JSON body" >&2
+    echo "Response body:" >&2
+    echo "${body}" >&2
+    exit 1
+  fi
+  printf '%s' "${body}"
+}
+
+install_autostart_service() {
+  local env_src="$1"
+  local run_cmd="$2"
+  local cfg_dir="${HOME}/.config/radiotiker-vnext"
+  local user_svc_dir="${HOME}/.config/systemd/user"
+  local env_dst="${cfg_dir}/agent.env"
+  local svc="${user_svc_dir}/radiotiker-vnext-agent.service"
+
+  mkdir -p "${cfg_dir}" "${user_svc_dir}"
+  cp "${env_src}" "${env_dst}"
+
+  cat > "${svc}" <<EOF
+[Unit]
+Description=RadioTiker vNext Thin Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=3
+EnvironmentFile=${env_dst}
+ExecStart=${run_cmd}
+
+[Install]
+WantedBy=default.target
+EOF
+
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl --user daemon-reload && systemctl --user enable --now radiotiker-vnext-agent.service; then
+      echo "✅ Auto-start service installed: ${svc}"
+    else
+      echo "⚠️ Could not start user service automatically."
+      echo "   Try manually:"
+      echo "   systemctl --user daemon-reload"
+      echo "   systemctl --user enable --now radiotiker-vnext-agent.service"
+    fi
+  fi
+
+  if command -v loginctl >/dev/null 2>&1; then
+    linger="$(loginctl show-user "${USER}" -p Linger 2>/dev/null | cut -d= -f2 || true)"
+    if [[ "${linger}" != "yes" ]]; then
+      echo "ℹ️ To keep agent running after reboot without login:"
+      echo "   sudo loginctl enable-linger ${USER}"
+    fi
+  fi
 }
 
 echo "== RadioTiker vNext agent onboarding =="
@@ -102,26 +184,23 @@ fi
 PUB_KEY="$(cat "${KEY_PATH}.pub")"
 
 echo "-- link/start"
-RESP_START="$(curl -fsS -X POST "${API_BASE}/agent/link/start" \
-  -H 'Content-Type: application/json' \
-  -d "{\"device_name\":\"${DEVICE_NAME}\",\"agent_version\":\"0.5.0\"}")"
+RESP_START="$(post_json_checked "${API_BASE}/agent/link/start" \
+  "{\"device_name\":\"${DEVICE_NAME}\",\"agent_version\":\"0.5.0\"}")"
 DEVICE_CODE="$(printf '%s' "${RESP_START}" | json_field "device_code")"
 LINK_URL="$(printf '%s' "${RESP_START}" | json_field "link_url")"
 echo "device_code=${DEVICE_CODE}"
 echo "link_url=${LINK_URL}"
 
 echo "-- link/complete"
-RESP_COMPLETE="$(curl -fsS -X POST "${API_BASE}/agent/link/complete" \
-  -H 'Content-Type: application/json' \
-  -d "{\"device_code\":\"${DEVICE_CODE}\",\"user_id\":\"${USER_ID}\"}")"
+RESP_COMPLETE="$(post_json_checked "${API_BASE}/agent/link/complete" \
+  "{\"device_code\":\"${DEVICE_CODE}\",\"user_id\":\"${USER_ID}\"}")"
 AGENT_TOKEN="$(printf '%s' "${RESP_COMPLETE}" | json_field "agent_token")"
 AGENT_ID="$(printf '%s' "${RESP_COMPLETE}" | json_field "agent_id")"
 echo "agent_id=${AGENT_ID}"
 
 echo "-- register-key"
-RESP_REGISTER="$(curl -fsS -X POST "${API_BASE}/agent/register-key" \
-  -H 'Content-Type: application/json' \
-  -d "{\"agent_token\":\"${AGENT_TOKEN}\",\"public_key\":\"${PUB_KEY}\",\"local_port\":${AGENT_PORT}}")"
+RESP_REGISTER="$(post_json_checked "${API_BASE}/agent/register-key" \
+  "{\"agent_token\":\"${AGENT_TOKEN}\",\"public_key\":\"${PUB_KEY}\",\"local_port\":${AGENT_PORT}}")"
 REMOTE_PORT="$(printf '%s' "${RESP_REGISTER}" | json_field "remote_port")"
 SSH_HOST="$(printf '%s' "${RESP_REGISTER}" | json_field "ssh_host")"
 SSH_USER="$(printf '%s' "${RESP_REGISTER}" | json_field "ssh_user")"
@@ -155,6 +234,18 @@ curl -fsS -X POST "${API_BASE}/agent/heartbeat" \
   -H 'Content-Type: application/json' \
   -d "{\"agent_token\":\"${AGENT_TOKEN}\",\"tunnel_ok\":true,\"last_scan\":$(date +%s)}" >/dev/null
 
+RUN_CMD=""
+if [[ -f "thin_agent.py" ]]; then
+  RUN_CMD="/usr/bin/python3 $(pwd)/thin_agent.py"
+elif [[ -x "${AGENT_BIN}" ]]; then
+  RUN_CMD="$(realpath "${AGENT_BIN}")"
+fi
+
+if [[ "${INSTALL_AUTOSTART}" -eq 1 && -n "${RUN_CMD}" ]]; then
+  echo "-- installing auto-start"
+  install_autostart_service "${ENV_FILE}" "${RUN_CMD}"
+fi
+
 echo "✅ Onboarding complete."
 echo "env_file=${ENV_FILE}"
 echo "To run agent:"
@@ -162,10 +253,27 @@ echo "  set -a; source ${ENV_FILE}; set +a"
 echo "  python3 thin_agent.py"
 
 if [[ "${RUN_AFTER}" -eq 1 ]]; then
-  echo "-- starting thin_agent.py"
+  echo "-- starting agent"
+  if [[ "${INSTALL_AUTOSTART}" -eq 1 ]] && command -v systemctl >/dev/null 2>&1; then
+    if systemctl --user restart radiotiker-vnext-agent.service; then
+      echo "✅ Started via user service: radiotiker-vnext-agent.service"
+      echo "Check status: systemctl --user status radiotiker-vnext-agent.service --no-pager"
+      exit 0
+    fi
+  fi
   set -a
   # shellcheck source=/dev/null
   source "${ENV_FILE}"
   set +a
-  exec python3 thin_agent.py
+  if [[ -f "thin_agent.py" ]]; then
+    exec python3 thin_agent.py
+  fi
+  if [[ -x "${AGENT_BIN}" ]]; then
+    exec "${AGENT_BIN}"
+  fi
+  echo "Could not start agent: thin_agent.py not found and --agent-bin not executable (${AGENT_BIN})" >&2
+  echo "Run manually by either:" >&2
+  echo "  1) cd to repo thin-agent folder and run python3 thin_agent.py" >&2
+  echo "  2) pass --agent-bin /path/to/radiotiker-thin-agent-vnext-latest-linux --run" >&2
+  exit 1
 fi

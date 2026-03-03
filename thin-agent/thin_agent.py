@@ -4,6 +4,9 @@ import os
 import time
 import hashlib
 import re
+import shutil
+import json
+import subprocess
 import requests
 from mutagen import File
 from dotenv import load_dotenv
@@ -23,6 +26,8 @@ AGENT_PORT = int(os.getenv("AGENT_PORT", "8765"))
 VALID_EXTENSIONS = tuple(os.getenv("VALID_AUDIO_EXTENSIONS", ".mp3,.flac,.wav,.m4a").split(","))
 VALID_EXTENSIONS = tuple(ext.strip().lower() for ext in VALID_EXTENSIONS if ext.strip())
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip() or None
+FULL_RESCAN_INTERVAL_MIN = int(os.getenv("FULL_RESCAN_INTERVAL_MIN", "0") or "0")
+ENABLE_ACOUSTID_SCAN = str(os.getenv("ENABLE_ACOUSTID_SCAN", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
 def _file_fingerprint(path: str) -> tuple[int, int]:
     st = os.stat(path)
@@ -106,6 +111,48 @@ def _technical_info(path: str):
         pass
     return codec, sample_rate, bit_depth, bitrate_kbps, channels
 
+
+def _acoustid_fingerprint(path: str):
+    """
+    Best-effort Chromaprint using fpcalc on the agent host.
+    Returns (fingerprint, duration) or (None, None).
+    """
+    if not ENABLE_ACOUSTID_SCAN:
+        return None, None
+    exe = shutil.which("fpcalc")
+    if not exe:
+        return None, None
+    try:
+        # Prefer JSON output when available.
+        p = subprocess.run([exe, "-json", path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, text=True, check=False)
+        out = (p.stdout or "").strip()
+        if out.startswith("{"):
+            j = json.loads(out)
+            fp = str(j.get("fingerprint") or "").strip()
+            dur = float(j.get("duration")) if j.get("duration") is not None else None
+            if fp:
+                return fp, dur
+    except Exception:
+        pass
+    try:
+        # Fallback key=value output.
+        p = subprocess.run([exe, path], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20, text=True, check=False)
+        fp = None
+        dur = None
+        for ln in (p.stdout or "").splitlines():
+            if ln.startswith("FINGERPRINT="):
+                fp = ln.split("=", 1)[1].strip()
+            elif ln.startswith("DURATION="):
+                try:
+                    dur = float(ln.split("=", 1)[1].strip())
+                except Exception:
+                    dur = None
+        if fp:
+            return fp, dur
+    except Exception:
+        pass
+    return None, None
+
 def announce_agent(user_id: str, base_url: str):
     payload = {"user_id": user_id, "base_url": base_url}
     try:
@@ -127,6 +174,7 @@ def scan_folder(folder_path, base_url):
                 size, mtime = _file_fingerprint(full_path)
                 rel = os.path.relpath(full_path, root_abs).replace("\\", "/")
                 duration_sec = _duration_seconds(full_path)
+                acoustid_fp, acoustid_dur = _acoustid_fingerprint(full_path)
                 codec, sample_rate, bit_depth, bitrate_kbps, channels = _technical_info(full_path)
                 track_no = _parse_first_int(_first_tag(audio, "tracknumber"))
                 disc_no = _parse_first_int(_first_tag(audio, "discnumber"))
@@ -155,6 +203,8 @@ def scan_folder(folder_path, base_url):
                     "file_size": size,
                     "mtime": mtime,
                     "duration_sec": duration_sec,
+                    "acoustid_fingerprint": acoustid_fp,
+                    "acoustid_duration": acoustid_dur,
                     "track_id": _track_id(full_path, size, mtime),
                 }
                 library.append(metadata)
@@ -162,7 +212,7 @@ def scan_folder(folder_path, base_url):
                 print(f"Error reading {full_path}: {e}")
     return library
 
-def send_in_batches(user_id, tracks, batch_size=300):
+def send_in_batches(user_id, tracks, batch_size=300, replace=True):
     if not tracks:
         print("No tracks found.")
         return
@@ -174,7 +224,7 @@ def send_in_batches(user_id, tracks, batch_size=300):
             "user_id": user_id,
             "library": chunk,
             "library_version": version,
-            "replace": bool(i == 0),
+            "replace": bool(replace and i == 0),
         }
         try:
             response = requests.post(SERVER_URL, json=payload, timeout=90)
@@ -194,13 +244,26 @@ if __name__ == "__main__":
     base = server.base_url()
     print(f"🔌 Local server: {base}")
     announce_agent(USER_ID, base)
-    tracks = scan_folder(library_root, base)
-    print(f"📁 Found {len(tracks)} tracks.")
-    send_in_batches(USER_ID, tracks)
+
+    def run_full_scan_cycle(reason: str = "scheduled"):
+        print(f"🔎 Full scan ({reason}) started")
+        tracks = scan_folder(library_root, base)
+        print(f"📁 Found {len(tracks)} tracks.")
+        send_in_batches(USER_ID, tracks, replace=True)
+        print(f"✅ Full scan ({reason}) completed")
+
+    run_full_scan_cycle("startup")
+
     # Keep the tunnel alive for long-running sessions.
     try:
+        last_scan_ts = time.time()
         while True:
             time.sleep(5)
+            if FULL_RESCAN_INTERVAL_MIN > 0:
+                now = time.time()
+                if (now - last_scan_ts) >= (FULL_RESCAN_INTERVAL_MIN * 60):
+                    run_full_scan_cycle("interval")
+                    last_scan_ts = now
     except KeyboardInterrupt:
         if tunnel:
             tunnel.stop()

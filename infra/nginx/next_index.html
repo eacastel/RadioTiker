@@ -48,18 +48,18 @@
 <body>
   <div class="card">
     <h1>RadioTiker vNext</h1>
-    <p>Thin Agent downloads for device onboarding.</p>
+    <p>Thin Agent downloads for device onboarding (no full repo clone needed).</p>
     <ul>
       <li>
-        Linux x86_64:
-        <a href="https://radio.tiker.es/downloads/radiotiker-thin-agent-latest-linux">
-          radiotiker-thin-agent-latest-linux
+        vNext Linux x86_64:
+        <a href="https://radio.tiker.es/downloads/radiotiker-thin-agent-vnext-latest-linux">
+          radiotiker-thin-agent-vnext-latest-linux
         </a>
       </li>
       <li>
-        ARM32 (Raspberry Pi):
-        <a href="https://radio.tiker.es/downloads/radiotiker-thin-agent-latest-arm32">
-          radiotiker-thin-agent-latest-arm32
+        vNext onboard helper script:
+        <a href="https://radio.tiker.es/downloads/radiotiker-vnext-onboard-latest.sh">
+          radiotiker-vnext-onboard-latest.sh
         </a>
       </li>
       <li>
@@ -68,8 +68,11 @@
       </li>
     </ul>
     <p style="margin-top:16px">
-      After download, run onboarding with:
-      <code>./onboard_and_start.sh --user-id &lt;user&gt; --library-path &lt;path&gt; --run</code>
+      Usage:
+      <code>curl -LO https://radio.tiker.es/downloads/radiotiker-thin-agent-vnext-latest-linux</code><br>
+      <code>curl -LO https://radio.tiker.es/downloads/radiotiker-vnext-onboard-latest.sh</code><br>
+      <code>chmod +x radiotiker-thin-agent-vnext-latest-linux radiotiker-vnext-onboard-latest.sh</code><br>
+      <code>./radiotiker-vnext-onboard-latest.sh --user-id &lt;user&gt; --library-path &lt;path&gt; --run</code>
     </p>
   </div>
 </body>

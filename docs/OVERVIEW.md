@@ -64,3 +64,4 @@ Plan status will gate device linking, scans, and station publishing.
 1. Define the signup flow and API keys.
 2. Define a single recommended network setup for users.
 3. Add database-backed library storage.
+4. Follow MySQL RDS runbook: `docs/MYSQL_RDS_OPERATIONS.md`.
