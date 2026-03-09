@@ -92,10 +92,6 @@ def player(user_id: str):
   .muted{{color:#777;font-size:13px}}
   .link-btn{{background:none;border:none;color:#2563eb;cursor:pointer;padding:0 2px;text-decoration:underline}}
   .link-btn[disabled]{{color:#9ca3af;cursor:default;text-decoration:none}}
-  .seek-row{{display:flex;align-items:center;gap:8px;margin-top:8px;flex-wrap:wrap}}
-  .seek-row input[type="range"]{{flex:1;min-width:180px}}
-  .seek-time{{font-variant-numeric:tabular-nums;min-width:84px;text-align:right}}
-  .seek-note{{font-size:12px;color:#777}}
   .now-meta{{margin-top:10px;padding:10px;border:1px solid #e5e7eb;border-radius:10px;background:#fafafa}}
   .now-meta-main{{display:grid;grid-template-columns:minmax(0,1fr) minmax(260px,600px);gap:12px;align-items:flex-start}}
   .now-meta-hero-wrap{{display:flex;justify-content:flex-end}}
@@ -187,13 +183,6 @@ def player(user_id: str):
       </div>
     </div>
   </div>
-  <div class="seek-row">
-    <button class="btn" type="button" onclick="skipBy(-15)">-15s</button>
-    <input id="seekBar" type="range" min="0" max="100" value="0" step="1">
-    <button class="btn" type="button" onclick="skipBy(15)">+15s</button>
-    <span id="seekTime" class="seek-time">0:00 / 0:00</span>
-  </div>
-  <div id="seekNote" class="seek-note"></div>
   <div id="statusBanner" class="status-banner"></div>
 </div>
 
@@ -262,6 +251,8 @@ let lastTid = null;
 let currentTrackDurationSec = 0;
 let currentStartOffsetSec = 0;
 let seekDragging = false;
+const START_TIMEOUT_NATIVE_MS = 8000;
+const START_TIMEOUT_MP3_MS = 25000;
 let wakeLock = null;
 let recoveryInFlight = false;
 let recoveryWindowStartMs = 0;
@@ -1514,11 +1505,6 @@ async function seekTo(targetSec) {{
   await playIdAt(currentTid, target, {{ recordHistory: false }});
 }}
 
-function skipBy(delta) {{
-  seekTo(currentPlaybackSec() + Number(delta || 0));
-}}
-window.skipBy = skipBy;
-
 async function ensureWakeLock() {{
   const ka = document.getElementById("keepAwake");
   if (!ka || !ka.checked) return;
@@ -1559,11 +1545,11 @@ async function playIdAt(tid, startSec, opts = {{}}) {{
   let started = false;
   let triedMp3Fallback = false;
   const primaryForceMp3 = !!m.force_mp3;
-  for (const forceMp3 of [primaryForceMp3, true]) {{
-    if (forceMp3 && primaryForceMp3) continue;
+  const startModes = primaryForceMp3 ? [true, false] : [false, true];
+  for (const forceMp3 of startModes) {{
     const url = urlFor(tid, forceMp3, currentStartOffsetSec);
     a1.src = url; a1.load();
-    try {{ await waitForCanPlay(a1, 8000); }} catch {{}}
+    try {{ await waitForCanPlay(a1, forceMp3 ? START_TIMEOUT_MP3_MS : START_TIMEOUT_NATIVE_MS); }} catch {{}}
     try {{
       await a1.play();
       started = true;
@@ -1574,6 +1560,18 @@ async function playIdAt(tid, startSec, opts = {{}}) {{
       break;
     }} catch {{}}
     if (!forceMp3) triedMp3Fallback = true;
+  }}
+  if (!started) {{
+    // One extra rescue attempt: warm cached MP3 path, then retry once.
+    try {{
+      const warmUrl = urlFor(tid, true, currentStartOffsetSec);
+      await fetch(warmUrl, {{ method: "HEAD", cache: "no-store" }});
+      a1.src = warmUrl; a1.load();
+      await waitForCanPlay(a1, START_TIMEOUT_MP3_MS);
+      await a1.play();
+      started = true;
+      m.force_mp3 = true;
+    }} catch {{}}
   }}
   if (!started) {{
     showStatus(
@@ -1603,11 +1601,8 @@ async function playIdAt(tid, startSec, opts = {{}}) {{
   noteProgress();
 }}
 window.playById = (tid) => {{
-  const shuffleOn = !!(document.getElementById('shuffle') && document.getElementById('shuffle').checked);
-  if (shuffleOn) {{
-    playNext();
-    return;
-  }}
+  // Explicit row "Play" must always honor the selected track.
+  // Shuffle only affects automatic/next selection, not direct picks.
   const useX = CROSSFADE_ENABLED && document.getElementById('xfade') && document.getElementById('xfade').checked;
   useX ? xfadeTo(tid, {{ recordHistory: true }}) : playIdAt(tid, 0, {{ recordHistory: true }});
 }};
@@ -1634,7 +1629,7 @@ async function xfadeTo(tid, opts = {{}}) {{
   const m = metaFor(tid);
   const url = urlFor(tid, !!m.force_mp3);
   helper.src = url; helper.load();
-  try {{ await waitForCanPlay(helper, 8000); }} catch (e) {{ console.warn("[xfade] helper timeout:", e); await playIdAt(tid, 0, {{ recordHistory }}); return; }}
+  try {{ await waitForCanPlay(helper, m && m.force_mp3 ? START_TIMEOUT_MP3_MS : START_TIMEOUT_NATIVE_MS); }} catch (e) {{ console.warn("[xfade] helper timeout:", e); await playIdAt(tid, 0, {{ recordHistory }}); return; }}
   try {{ await helper.play(); }} catch {{ await playIdAt(tid, 0, {{ recordHistory }}); return; }}
 
   // 2) Run gain ramps
@@ -1676,7 +1671,7 @@ async function xfadeTo(tid, opts = {{}}) {{
       a1.src = helper.src;
       a1.load();
       try {{ a1.currentTime = tcur; }} catch {{}}
-      try {{ await waitForCanPlay(a1, 8000); }} catch {{}}
+      try {{ await waitForCanPlay(a1, START_TIMEOUT_NATIVE_MS); }} catch {{}}
       try {{ await a1.play(); }} catch {{ }}
 
       // Now stop helper and normalize gains
@@ -1785,22 +1780,6 @@ function kickIfEmpty() {{
     }}
     setTimeout(() => a1.play().catch(() => {{}}), 0);
   }}
-}}
-
-const seekBarEl = document.getElementById("seekBar");
-if (seekBarEl) {{
-  seekBarEl.addEventListener("input", () => {{
-    seekDragging = true;
-    const label = document.getElementById("seekTime");
-    const dur = Math.max(0, Number(currentTrackDurationSec) || 0);
-    const pos = clamp(Number(seekBarEl.value) || 0, 0, dur > 0 ? dur : 0);
-    if (label) label.textContent = formatDuration(pos) + " / " + formatDuration(dur);
-  }});
-  seekBarEl.addEventListener("change", async () => {{
-    const v = Number(seekBarEl.value) || 0;
-    seekDragging = false;
-    await seekTo(v);
-  }});
 }}
 
 function parseTrackIdFromSrc(src) {{
