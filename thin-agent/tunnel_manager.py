@@ -4,6 +4,7 @@ import os
 import time
 import threading
 import subprocess
+from typing import Optional
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -38,9 +39,12 @@ class TunnelConfig:
             "ssh",
             "-N",
             "-T",
+            "-o", "BatchMode=yes",
             "-o", "ExitOnForwardFailure=yes",
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=3",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "ConnectTimeout=10",
             "-i", self.ssh_key_path,
             "-p", str(self.ssh_port),
             "-R", f"{self.remote_port}:127.0.0.1:{self.local_port}",
@@ -55,6 +59,7 @@ class ReverseTunnel:
         self._stop = threading.Event()
         self._thread = None
         self._proc = None
+        self._last_err: Optional[str] = None
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -86,10 +91,21 @@ class ReverseTunnel:
                 self._proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
                 )
                 while self._proc.poll() is None and not self._stop.is_set():
                     time.sleep(1)
+                if self._proc and self._proc.stderr:
+                    try:
+                        err = (self._proc.stderr.read() or "").strip()
+                    except Exception:
+                        err = ""
+                    if err:
+                        # Keep log concise; first line is usually enough (auth/host key/port blocked).
+                        first = err.splitlines()[0]
+                        self._last_err = first
+                        self.log(f"⚠️ Tunnel ssh error: {first}")
             except Exception as e:
                 self.log(f"❌ Tunnel error: {e}")
 

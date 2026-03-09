@@ -43,6 +43,7 @@ This will:
 1. Generate a persistent SSH key in `~/.radiotiker/agent_ed25519` (if missing).
 2. Call `link/start`, `link/complete`, and `register-key`.
 3. Write tunnel + API config into `.env`.
+4. Persist scan resume checkpoints in `~/.radiotiker/scan_resume_<user_id>.json` so restarts resume from last committed uploaded batch.
 
 To start immediately after onboarding:
 
@@ -51,6 +52,15 @@ To start immediately after onboarding:
   --user-id eacastel \
   --library-path /path/to/Music \
   --run
+```
+
+To start the GUI immediately after onboarding:
+
+```bash
+./onboard_and_start.sh \
+  --user-id eacastel \
+  --library-path /path/to/Music \
+  --gui
 ```
 
 In the GUI agent, use `Open Library` to launch the browser player at:
@@ -68,6 +78,10 @@ To enable Linux user auto-start service explicitly:
 Auto-start files:
 1. `~/.config/systemd/user/radiotiker-vnext-agent.service`
 2. `~/.config/radiotiker-vnext/agent.env`
+
+Resume controls:
+1. `RT_SCAN_RESUME_ENABLED=1` (default) enables checkpointed scan resume.
+2. `RT_SCAN_RESUME_RESET=1` forces a fresh full scan and resets checkpoint.
 
 ## Publish vNext Thin Distribution (binary + onboard script)
 

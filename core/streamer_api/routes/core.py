@@ -1,7 +1,9 @@
 from typing import Dict, Any, Optional
 import json, time, requests
 import os, subprocess, re
+import hashlib
 import uuid
+from difflib import SequenceMatcher
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, Response
 from ..models import (
@@ -12,6 +14,7 @@ from ..models import (
     MetadataLibraryUpsertPayload,
     MetadataEnrichPayload,
     MetadataEnrichLibraryPayload,
+    MetadataResetPayload,
 )
 from ..storage import (
     load_lib,
@@ -26,6 +29,9 @@ from ..storage import (
     db_insert_provider_snapshot,
     db_upsert_override,
     db_find_metadata_seed,
+    db_delete_overrides,
+    db_delete_provider_snapshots,
+    db_delete_tracks,
 )
 from ..utils import normalize_rel_path, build_stream_url, enrich_track_metadata, normalize_text_key
 from ..metadata_providers import search_candidates
@@ -40,6 +46,54 @@ METADATA_PATCH_FIELDS = {
     "artist_bio", "album_bio",
 }
 
+LEGACY_AUDIO_EXTS = {
+    ".flac", ".wav", ".aif", ".aiff", ".ape", ".alac", ".wv",
+    ".ogg", ".opus", ".wma", ".dsf", ".dff",
+}
+
+PLAYABILITY_BAD_THRESHOLD = max(1, int(os.getenv("RT_PLAYABILITY_BAD_THRESHOLD", "3") or "3"))
+
+
+def _track_needs_mp3_proxy(track: Dict[str, Any]) -> bool:
+    rel = str(track.get("rel_path") or track.get("path") or "")
+    if not rel:
+        return False
+    leaf = rel.rsplit("/", 1)[-1].split("?", 1)[0]
+    dot = leaf.rfind(".")
+    if dot < 0:
+        return False
+    return leaf[dot:].lower() in LEGACY_AUDIO_EXTS
+
+
+def _mark_track_playability(user_id: str, track_id: str, ok: bool, reason: Optional[str] = None):
+    """
+    Persist best-effort playback health per track to avoid repeatedly selecting broken tracks.
+    """
+    try:
+        lib = load_lib(user_id)
+        track = (lib.get("tracks") or {}).get(track_id)
+        if not track:
+            return
+        now_ts = int(time.time())
+        if ok:
+            track["playability_status"] = "ok"
+            track["playability_fail_count"] = 0
+            track["playability_last_ok_at"] = now_ts
+            track.pop("playability_last_error", None)
+        else:
+            try:
+                fail_count = int(track.get("playability_fail_count") or 0) + 1
+            except Exception:
+                fail_count = 1
+            track["playability_fail_count"] = fail_count
+            track["playability_last_fail_at"] = now_ts
+            track["playability_last_error"] = str(reason or "playback-error")[:240]
+            track["playability_status"] = "bad" if fail_count >= PLAYABILITY_BAD_THRESHOLD else "flaky"
+        save_lib(user_id, lib)
+        db_upsert_tracks(user_id, [track])
+    except Exception as e:
+        print(f"[playability] update failed user={user_id} track={track_id} err={e}")
+
 
 def _is_weak_text(v: Any) -> bool:
     s = str(v or "").strip()
@@ -52,6 +106,120 @@ def _is_weak_text(v: Any) -> bool:
 def _is_generic_title(v: Any) -> bool:
     s = str(v or "").strip().lower()
     return bool(re.fullmatch(r"(track|song)\s*\d{1,3}", s))
+
+
+def _sim_text(a: Any, b: Any) -> float:
+    x = normalize_text_key(a)
+    y = normalize_text_key(b)
+    if not x and not y:
+        return 1.0
+    if not x or not y:
+        return 0.0
+    return SequenceMatcher(None, x, y).ratio()
+
+
+def _provider_min_score(provider: str, default_min: float) -> float:
+    p = str(provider or "").strip().lower()
+    if p == "musicbrainz":
+        try:
+            return max(default_min, float(os.getenv("RT_AUTO_ENRICH_MIN_SCORE_MUSICBRAINZ", "0.0")))
+        except Exception:
+            return default_min
+    if p == "discogs":
+        try:
+            return max(default_min, float(os.getenv("RT_AUTO_ENRICH_MIN_SCORE_DISCOGS", "0.0")))
+        except Exception:
+            return default_min
+    if p == "acoustid":
+        try:
+            return max(default_min, float(os.getenv("RT_AUTO_ENRICH_MIN_SCORE_ACOUSTID", "0.90")))
+        except Exception:
+            return max(default_min, 0.90)
+    return default_min
+
+
+def _source_provider(source: Any) -> str:
+    s = str(source or "").strip().lower()
+    if ":" in s:
+        return s.split(":", 1)[1]
+    return s
+
+
+def _has_rich_media(track: Dict[str, Any]) -> bool:
+    return bool(
+        track.get("artwork_url")
+        or (track.get("artwork_urls") or [])
+        or (track.get("artist_image_urls") or [])
+        or str(track.get("artist_bio") or "").strip()
+        or str(track.get("album_bio") or "").strip()
+    )
+
+
+def _overwrite_allowed(current: Dict[str, Any], best: Dict[str, Any], mode: str) -> bool:
+    """
+    Score-aware overwrite policy:
+    - manual mode always allowed
+    - auto/batch do not overwrite manual edits
+    - auto/batch overwrite only when clearly better or current data is weak
+    """
+    if mode == "manual":
+        return True
+
+    current_source = str(current.get("metadata_source") or "").strip().lower()
+    if current_source.startswith("manual:"):
+        return False
+    if not current_source or current_source.startswith("seed:"):
+        return True
+
+    if not _has_rich_media(current):
+        return True
+
+    try:
+        margin = float(os.getenv("RT_AUTO_ENRICH_OVERWRITE_MARGIN", "0.04"))
+    except Exception:
+        margin = 0.04
+    margin = max(0.0, min(margin, 0.25))
+
+    try:
+        current_score = float(current.get("metadata_source_score"))
+    except Exception:
+        current_score = 0.0
+    new_score = float(best.get("score") or 0.0)
+
+    cur_provider = _source_provider(current_source)
+    new_provider = str(best.get("provider") or "").strip().lower()
+    if new_provider and new_provider == cur_provider:
+        return new_score >= (current_score + margin)
+    return new_score >= (current_score + margin + 0.03)
+
+
+def _candidate_passes_sanity(track: Dict[str, Any], best: Dict[str, Any]) -> bool:
+    """
+    Block obviously wrong substitutions even when provider score is high.
+    """
+    patch = best.get("patch") or {}
+    cur_title = track.get("title")
+    cur_artist = track.get("artist")
+    cur_album = track.get("album")
+    cand_title = patch.get("title")
+    cand_artist = patch.get("artist")
+    cand_album = patch.get("album")
+
+    if not _is_weak_text(cur_artist) and cand_artist and _sim_text(cur_artist, cand_artist) < 0.58:
+        return False
+    if not _is_weak_text(cur_album) and cand_album and _sim_text(cur_album, cand_album) < 0.45:
+        return False
+    if (not _is_weak_text(cur_title)) and (not _is_generic_title(cur_title)) and cand_title and _sim_text(cur_title, cand_title) < 0.52:
+        return False
+
+    # AcoustID can produce odd collisions on weak tags; require basic non-empty patch text.
+    provider = str(best.get("provider") or "").lower()
+    if provider == "acoustid":
+        if not str(cand_title or "").strip():
+            return False
+        if not str(cand_artist or "").strip():
+            return False
+    return True
 
 
 def _apply_seed_metadata(current: Dict[str, Any], seed: Dict[str, Any]) -> Dict[str, Any]:
@@ -220,6 +388,226 @@ def _ffmpeg_cmd_for_http_input(url: str, abr_kbps: int = 192, start_sec: float =
     return cmd
 
 
+def _ffmpeg_cmd_to_file(url: str, out_path: str, abr_kbps: int = 192) -> list[str]:
+    cmd = _ffmpeg_cmd_for_http_input(url, abr_kbps=abr_kbps, start_sec=0.0)
+    # Replace stdout sink with explicit output file.
+    if cmd and cmd[-1] == "-":
+        cmd = cmd[:-1]
+    cmd += ["-y", out_path]
+    return cmd
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = str(os.getenv(name, "1" if default else "0")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _cache_dir() -> str:
+    return os.getenv("RT_MP3_CACHE_DIR", "/tmp/radiotiker_mp3_cache")
+
+
+def _cache_key(user_id: str, track_id: str, src_url: str, abr_kbps: int) -> str:
+    base = f"{user_id}|{track_id}|{src_url}|{abr_kbps}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+def _cache_paths(user_id: str, track_id: str, src_url: str, abr_kbps: int) -> tuple[str, str]:
+    key = _cache_key(user_id=user_id, track_id=track_id, src_url=src_url, abr_kbps=abr_kbps)
+    root = _cache_dir()
+    os.makedirs(root, exist_ok=True)
+    mp3_path = os.path.join(root, f"{key}.mp3")
+    lock_path = mp3_path + ".lock"
+    return mp3_path, lock_path
+
+
+def _try_build_cached_mp3(user_id: str, track_id: str, src_url: str, abr_kbps: int = 192) -> Optional[str]:
+    """
+    Best-effort cache build. Returns mp3 path if available, else None.
+    Uses a lock file so concurrent requests do not launch duplicate ffmpeg jobs.
+    """
+    mp3_path, lock_path = _cache_paths(user_id=user_id, track_id=track_id, src_url=src_url, abr_kbps=abr_kbps)
+    expected_duration_sec = _probe_duration_sec(src_url)
+
+    def cache_usable(path: str) -> bool:
+        try:
+            if not os.path.exists(path):
+                return False
+            if os.path.getsize(path) < 128 * 1024:
+                return False
+            if not expected_duration_sec:
+                return True
+            got = _probe_duration_sec(path)
+            if not got:
+                return False
+            # Reject truncated files that are far shorter than source duration.
+            return got >= (expected_duration_sec * 0.90)
+        except Exception:
+            return False
+
+    if cache_usable(mp3_path):
+        return mp3_path
+    if os.path.exists(mp3_path):
+        try:
+            os.unlink(mp3_path)
+        except Exception:
+            pass
+
+    got_lock = False
+    lock_fd = None
+    lock_deadline = time.time() + 90.0
+    while time.time() < lock_deadline:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(lock_fd, str(os.getpid()).encode("ascii"))
+            got_lock = True
+            break
+        except FileExistsError:
+            if cache_usable(mp3_path):
+                return mp3_path
+            time.sleep(0.25)
+        except Exception:
+            break
+
+    if not got_lock:
+        if cache_usable(mp3_path):
+            return mp3_path
+        return None
+
+    tmp_path = mp3_path + ".tmp"
+    try:
+        cmd = _ffmpeg_cmd_to_file(src_url, tmp_path, abr_kbps=abr_kbps)
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1800,
+            check=False,
+        )
+        if cache_usable(tmp_path):
+            os.replace(tmp_path, mp3_path)
+            return mp3_path
+    except Exception:
+        pass
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+        try:
+            if lock_fd is not None:
+                os.close(lock_fd)
+        except Exception:
+            pass
+        try:
+            if os.path.exists(lock_path):
+                os.unlink(lock_path)
+        except Exception:
+            pass
+    return None
+
+
+def _parse_single_range(range_header: Optional[str], total_size: int) -> Optional[tuple[int, int]]:
+    """
+    Parse HTTP Range header for single-byte ranges.
+    Returns (start, end) inclusive or None if no usable header.
+    Raises ValueError for invalid/unsatisfiable ranges.
+    """
+    if not range_header:
+        return None
+    s = str(range_header).strip().lower()
+    if not s.startswith("bytes="):
+        raise ValueError("invalid range unit")
+    part = s[6:].strip()
+    if "," in part:
+        raise ValueError("multiple ranges not supported")
+    if "-" not in part:
+        raise ValueError("invalid range format")
+    a, b = part.split("-", 1)
+    if a == "":
+        # Suffix range: bytes=-N
+        n = int(b)
+        if n <= 0:
+            raise ValueError("invalid suffix length")
+        start = max(0, total_size - n)
+        end = total_size - 1
+        return (start, end)
+    start = int(a)
+    end = total_size - 1 if b == "" else int(b)
+    if start < 0 or end < start or start >= total_size:
+        raise ValueError("unsatisfiable range")
+    end = min(end, total_size - 1)
+    return (start, end)
+
+
+def _serve_mp3_file(path: str, request: Request, duration_sec: Optional[float], abr_kbps: int, start_sec: float) -> Response:
+    total = os.path.getsize(path)
+    media_type = "audio/mpeg"
+    if total <= 0:
+        raise HTTPException(status_code=500, detail="Empty cached mp3")
+
+    range_header = request.headers.get("range")
+    try:
+        rng = _parse_single_range(range_header, total)
+    except ValueError:
+        return Response(
+            status_code=416,
+            headers={
+                "Content-Range": f"bytes */{total}",
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store, must-revalidate",
+                "Accept-Ranges": "bytes",
+            },
+        )
+
+    if rng is None and start_sec > 0:
+        # For CBR output this is a reliable seek approximation.
+        approx = int(start_sec * (abr_kbps * 1000 / 8))
+        start = min(max(0, approx), max(0, total - 1))
+        rng = (start, total - 1)
+
+    status_code = 200
+    start = 0
+    end = total - 1
+    if rng is not None:
+        start, end = rng
+        status_code = 206
+
+    length = end - start + 1
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store, must-revalidate",
+        "Accept-Ranges": "bytes",
+        "X-Accel-Buffering": "no",
+        "X-Relay-Mode": "cached-file",
+        "Content-Type": media_type,
+        "Content-Length": str(length),
+    }
+    if duration_sec:
+        headers["X-Content-Duration"] = str(duration_sec)
+        headers["Content-Duration"] = str(duration_sec)
+    if start_sec > 0:
+        headers["X-Start-Offset"] = f"{start_sec:.3f}"
+    if status_code == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+
+    if request.method == "HEAD":
+        return Response(status_code=status_code, headers=headers, media_type=media_type)
+
+    def gen():
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(256 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(gen(), status_code=status_code, media_type=media_type, headers=headers)
+
+
 
 # -------- debug --------
 @router.get("/debug/peek/{user_id}/{track_id}")
@@ -270,6 +658,123 @@ def clear_library(user_id: str):
     lib["_cleared_for"] = 0
     save_lib(user_id, lib)
     return {"ok": True, "cleared": True, "version": lib["version"]}
+
+
+@router.post("/library/{user_id}/reset-enrichment")
+def reset_library_enrichment(user_id: str, payload: MetadataResetPayload):
+    """
+    Reset enriched metadata either for selected tracks or entire library.
+    Keeps scanned files and rel paths intact.
+    """
+    lib = load_lib(user_id)
+    tracks = lib.get("tracks", {})
+    target_ids = [str(tid) for tid in (payload.track_ids or []) if str(tid) in tracks]
+    if not target_ids:
+        target_ids = list(tracks.keys())
+    if not target_ids:
+        return {"ok": True, "changed": 0, "track_ids": [], "version": lib.get("version")}
+
+    changed = 0
+    db_rows = []
+    for tid in target_ids:
+        cur = tracks.get(tid)
+        if not cur:
+            continue
+        nxt = dict(cur)
+        # Restore scan-origin core tags when available.
+        for fld in ("title", "artist", "album", "genre", "year"):
+            scan_key = f"_scan_{fld}"
+            if scan_key in nxt:
+                nxt[fld] = nxt.get(scan_key)
+        # Remove enriched media and source metadata.
+        nxt["artwork_url"] = ""
+        nxt["artwork_urls"] = []
+        nxt["artist_image_urls"] = []
+        nxt["artist_bio"] = ""
+        nxt["album_bio"] = ""
+        nxt["metadata_source"] = ""
+        nxt["metadata_source_score"] = None
+        nxt.pop("metadata_source_updated_at", None)
+        nxt.pop("_auto_enrich_ts", None)
+        nxt.update(enrich_track_metadata(nxt))
+
+        if any(cur.get(k) != nxt.get(k) for k in nxt.keys()):
+            tracks[tid] = nxt
+            changed += 1
+            db_rows.append(nxt)
+
+    if db_rows:
+        lib["version"] = int(time.time())
+        save_lib(user_id, lib)
+        db_upsert_tracks(user_id, db_rows)
+
+    if payload.clear_overrides:
+        db_delete_overrides(user_id, target_ids)
+    if payload.clear_provider_snapshots:
+        db_delete_provider_snapshots(target_ids)
+
+    return {
+        "ok": True,
+        "changed": changed,
+        "track_ids": target_ids,
+        "version": lib["version"],
+    }
+
+
+@router.post("/library/{user_id}/track/{track_id}/auto-enrich")
+def set_track_auto_enrich(user_id: str, track_id: str, payload: Dict[str, Any]):
+    """
+    Per-track lock to avoid automatic enrichment (quota protection / bad matches).
+    """
+    lib = load_lib(user_id)
+    track = lib.get("tracks", {}).get(track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="Unknown track_id")
+    enabled = bool(payload.get("enabled", True))
+    track["auto_enrich_disabled"] = not enabled
+    lib["version"] = int(time.time())
+    save_lib(user_id, lib)
+    db_upsert_tracks(user_id, [track])
+    return {
+        "ok": True,
+        "track_id": track_id,
+        "auto_enrich_enabled": enabled,
+        "version": lib["version"],
+    }
+
+
+@router.post("/library/{user_id}/track/{track_id}/hide")
+def set_track_hidden(user_id: str, track_id: str, payload: Dict[str, Any]):
+    lib = load_lib(user_id)
+    track = lib.get("tracks", {}).get(track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="Unknown track_id")
+    hidden = bool(payload.get("hidden", True))
+    reason = str(payload.get("reason") or "").strip()
+    track["is_hidden"] = hidden
+    if hidden:
+        track["hidden_at"] = int(time.time())
+        if reason:
+            track["hidden_reason"] = reason
+    else:
+        track.pop("hidden_at", None)
+        track.pop("hidden_reason", None)
+    lib["version"] = int(time.time())
+    save_lib(user_id, lib)
+    db_upsert_tracks(user_id, [track])
+    return {"ok": True, "track_id": track_id, "is_hidden": hidden, "version": lib["version"]}
+
+
+@router.delete("/library/{user_id}/track/{track_id}")
+def remove_track(user_id: str, track_id: str):
+    lib = load_lib(user_id)
+    if track_id not in lib.get("tracks", {}):
+        raise HTTPException(status_code=404, detail="Unknown track_id")
+    lib["tracks"].pop(track_id, None)
+    lib["version"] = int(time.time())
+    save_lib(user_id, lib)
+    db_delete_tracks(user_id, [track_id], purge_related=True)
+    return {"ok": True, "removed": True, "track_id": track_id, "version": lib["version"]}
 
 @router.post("/library/{user_id}/migrate-relpaths")
 def migrate_relpaths(user_id: str):
@@ -363,7 +868,7 @@ def metadata_enrich_track(user_id: str, track_id: str, payload: MetadataEnrichPa
     if not track:
         raise HTTPException(status_code=404, detail="Unknown track_id")
 
-    providers = payload.providers or ["musicbrainz", "discogs"]
+    providers = payload.providers or ["musicbrainz", "discogs", "acoustid"]
     searched = search_candidates(track, providers=providers, include_errors=True)
     candidates = searched.get("candidates", [])
     provider_errors = searched.get("errors", [])
@@ -378,7 +883,9 @@ def metadata_enrich_track(user_id: str, track_id: str, payload: MetadataEnrichPa
 
     best = candidates[0]
     min_score = float(payload.min_score or 0.78)
-    accepted = best.get("score", 0) >= min_score
+    accepted = best.get("score", 0) >= _provider_min_score(str(best.get("provider") or ""), min_score)
+    if accepted and not _candidate_passes_sanity(track, best):
+        accepted = False
     rule = None
     changed = False
 
@@ -393,6 +900,9 @@ def metadata_enrich_track(user_id: str, track_id: str, payload: MetadataEnrichPa
         )
         patched = dict(track)
         patched.update(patch)
+        patched["metadata_source"] = f"manual:{str(best.get('provider') or 'unknown')}"
+        patched["metadata_source_score"] = float(best.get("score") or 0.0)
+        patched["metadata_source_updated_at"] = int(time.time())
         patched.update(enrich_track_metadata(patched))
         if any(track.get(k) != patched.get(k) for k in patched.keys()):
             lib["tracks"][track_id] = patched
@@ -422,7 +932,7 @@ def metadata_enrich_library(user_id: str, payload: MetadataEnrichLibraryPayload)
     tracks = list(lib.get("tracks", {}).values())
     limit = max(1, min(int(payload.limit or 25), 500))
     min_score = float(payload.min_score or 0.78)
-    providers = payload.providers or ["musicbrainz", "discogs"]
+    providers = payload.providers or ["musicbrainz", "discogs", "acoustid"]
 
     # prioritize low-quality metadata first
     tracks.sort(key=lambda t: int(t.get("metadata_quality") or 0))
@@ -446,7 +956,17 @@ def metadata_enrich_library(user_id: str, payload: MetadataEnrichLibraryPayload)
             })
             continue
         best = candidates[0]
-        if float(best.get("score") or 0.0) < min_score:
+        score = float(best.get("score") or 0.0)
+        if score < _provider_min_score(str(best.get("provider") or ""), min_score):
+            details.append({
+                "track_id": t.get("track_id"),
+                "title": t.get("title"),
+                "artist": t.get("artist"),
+                "best": best,
+                "provider_errors": provider_errors,
+            })
+            continue
+        if not _candidate_passes_sanity(t, best):
             details.append({
                 "track_id": t.get("track_id"),
                 "title": t.get("title"),
@@ -474,10 +994,15 @@ def metadata_enrich_library(user_id: str, payload: MetadataEnrichLibraryPayload)
             )
             patched = dict(t)
             patched.update(patch)
+            patched["metadata_source"] = f"batch:{str(best.get('provider') or 'unknown')}"
+            patched["metadata_source_score"] = float(best.get("score") or 0.0)
+            patched["metadata_source_updated_at"] = int(time.time())
             patched.update(enrich_track_metadata(patched))
             tid = str(t.get("track_id"))
             original = lib["tracks"].get(tid)
-            if original and any(original.get(k) != patched.get(k) for k in patched.keys()):
+            overwrite_ok = _overwrite_allowed(original or {}, best, mode="batch")
+            item["overwrite_allowed"] = overwrite_ok
+            if overwrite_ok and original and any(original.get(k) != patched.get(k) for k in patched.keys()):
                 lib["tracks"][tid] = patched
                 db_upsert_tracks(user_id, [patched])
                 db_upsert_override(tid, user_id, patch)
@@ -537,6 +1062,90 @@ def agent_status(user_id: str):
 def get_library(user_id: str):
     lib = load_lib(user_id)
     return {"version": lib["version"], "tracks": list(lib["tracks"].values())}
+
+
+@router.get("/mobile/bootstrap/{user_id}")
+def get_mobile_bootstrap(user_id: str):
+    """
+    Mobile-first payload for Expo/React Native clients.
+    Returns compact catalog + stream path hints without UI-specific shape.
+    """
+    lib = load_lib(user_id)
+    tracks = []
+    albums: Dict[str, Dict[str, Any]] = {}
+    mobile_force_mp3 = str(os.getenv("RT_MOBILE_FORCE_MP3", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    for t in lib["tracks"].values():
+        tid = str(t.get("track_id") or "")
+        if not tid:
+            continue
+        artist = str(t.get("artist") or "Unknown Artist")
+        album = str(t.get("album") or "Unknown Album")
+        title = str(t.get("title") or "Unknown Title")
+        album_key = f"{artist}::{album}".lower()
+        art_urls = t.get("artwork_urls") or []
+        artist_urls = t.get("artist_image_urls") or []
+        artwork_url = str(
+            t.get("artwork_url")
+            or (art_urls[0] if art_urls else "")
+            or ""
+        )
+        artist_image_url = str((artist_urls[0] if artist_urls else "") or "")
+        force_mp3 = _track_needs_mp3_proxy(t)
+        stream_path_mobile = f"/streamer/api/relay-mp3/{user_id}/{tid}" if mobile_force_mp3 else (
+            f"/streamer/api/{'relay-mp3' if force_mp3 else 'relay'}/{user_id}/{tid}"
+        )
+        row = {
+            "track_id": tid,
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "genre": str(t.get("genre") or ""),
+            "year": t.get("year"),
+            "duration_sec": float(t.get("duration_sec") or 0),
+            "track_no": t.get("track_no"),
+            "disc_no": t.get("disc_no"),
+            "codec": str(t.get("codec") or ""),
+            "format_family": str(t.get("format_family") or ""),
+            "metadata_source": str(t.get("metadata_source") or ""),
+            "metadata_source_score": t.get("metadata_source_score"),
+            "metadata_quality": int(t.get("metadata_quality") or 0),
+            "artwork_url": artwork_url,
+            "artist_image_url": artist_image_url,
+            "artist_bio": str(t.get("artist_bio") or ""),
+            "album_bio": str(t.get("album_bio") or ""),
+            "needs_transcode": bool(force_mp3),
+            "stream_path": f"/streamer/api/{'relay-mp3' if force_mp3 else 'relay'}/{user_id}/{tid}",
+            "stream_path_mobile": stream_path_mobile,
+            "stream_path_mp3": f"/streamer/api/relay-mp3/{user_id}/{tid}",
+            "stream_path_native": f"/streamer/api/relay/{user_id}/{tid}",
+        }
+        tracks.append(row)
+        bucket = albums.setdefault(
+            album_key,
+            {
+                "album_key": album_key,
+                "album": album,
+                "artist": artist,
+                "year": t.get("year"),
+                "genre": str(t.get("genre") or ""),
+                "artwork_url": artwork_url,
+                "track_ids": [],
+            },
+        )
+        bucket["track_ids"].append(tid)
+
+    tracks.sort(key=lambda x: (x["artist"].lower(), x["album"].lower(), x["disc_no"] or 0, x["track_no"] or 0, x["title"].lower()))
+    album_list = sorted(albums.values(), key=lambda x: (str(x["artist"]).lower(), str(x["album"]).lower()))
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "version": int(lib.get("version") or 0),
+        "api_base_hint": "/streamer/api",
+        "mobile_force_mp3": bool(mobile_force_mp3),
+        "generated_at": int(time.time()),
+        "tracks": tracks,
+        "albums": album_list,
+    }
 
 
 @router.get("/library/{user_id}/metadata-summary")
@@ -764,20 +1373,44 @@ def submit_scan(payload: ScanPayload):
         auto_cooldown_sec = 43200
     auto_cooldown_sec = max(300, min(auto_cooldown_sec, 86400 * 7))
     now_ts = int(time.time())
+    seed_enabled = str(os.getenv("RT_DB_SEED_ENABLED", "1")).strip().lower() not in {"0", "false", "off", "no"}
     for t in payload.library:
         d = t.model_dump()
+        # Persist scanner-origin core fields so bad enrichments can be rolled back later.
+        for fld in ("title", "artist", "album", "genre", "year"):
+            d[f"_scan_{fld}"] = d.get(fld)
         if d.get("rel_path"):
             d["rel_path"] = normalize_rel_path(d["rel_path"])
         d = _apply_metadata_library_patch(d, payload.user_id)
         d.update(enrich_track_metadata(d))
-        seed = db_find_metadata_seed(payload.user_id, d)
+        seed = db_find_metadata_seed(payload.user_id, d) if seed_enabled else None
+        seed_applied = False
         if seed:
             d = _apply_seed_metadata(d, seed)
+            if any(seed.get(k) and d.get(k) == seed.get(k) for k in ("artwork_url", "artist_bio", "album_bio")):
+                seed_applied = True
             d.update(enrich_track_metadata(d))
         existing = tracks.get(d["track_id"]) or {}
         # Preserve internal enrichment markers across rescans.
         if existing.get("_auto_enrich_ts"):
             d["_auto_enrich_ts"] = existing.get("_auto_enrich_ts")
+        if existing.get("metadata_source") and not d.get("metadata_source"):
+            d["metadata_source"] = existing.get("metadata_source")
+        if existing.get("metadata_source_score") is not None and d.get("metadata_source_score") is None:
+            d["metadata_source_score"] = existing.get("metadata_source_score")
+        if existing.get("metadata_source_updated_at") and not d.get("metadata_source_updated_at"):
+            d["metadata_source_updated_at"] = existing.get("metadata_source_updated_at")
+        if existing.get("auto_enrich_disabled"):
+            d["auto_enrich_disabled"] = True
+        if existing.get("is_hidden"):
+            d["is_hidden"] = True
+            if existing.get("hidden_at"):
+                d["hidden_at"] = existing.get("hidden_at")
+            if existing.get("hidden_reason"):
+                d["hidden_reason"] = existing.get("hidden_reason")
+        if seed_applied:
+            d["metadata_source"] = "seed:db"
+            d["metadata_source_score"] = 1.0
         tracks[d["track_id"]] = d
         db_rows.append(d)
         # Incremental enrichment target: new/changed tracks still missing rich media metadata.
@@ -785,19 +1418,18 @@ def submit_scan(payload: ScanPayload):
             str(existing.get(k) or "").strip() != str(d.get(k) or "").strip()
             for k in ("title", "artist", "album", "rel_path")
         )
-        lacks_rich_meta = not (
-            d.get("artwork_url")
-            or (d.get("artwork_urls") or [])
-            or (d.get("artist_image_urls") or [])
-            or str(d.get("artist_bio") or "").strip()
-            or str(d.get("album_bio") or "").strip()
-        )
+        lacks_rich_meta = not _has_rich_media(d)
         try:
             last_attempt_ts = int(existing.get("_auto_enrich_ts") or 0)
         except Exception:
             last_attempt_ts = 0
         cooldown_ok = (now_ts - last_attempt_ts) >= auto_cooldown_sec
-        if lacks_rich_meta and (not last_attempt_ts or cooldown_ok or changed_key_fields):
+        if (
+            lacks_rich_meta
+            and not bool(d.get("auto_enrich_disabled"))
+            and not bool(d.get("is_hidden"))
+            and (not last_attempt_ts or cooldown_ok or changed_key_fields)
+        ):
             auto_enrich_candidates.append(str(d["track_id"]))
 
     lib["version"] = session_ver
@@ -809,6 +1441,16 @@ def submit_scan(payload: ScanPayload):
     auto_scanned = 0
     auto_matched = 0
     auto_applied = 0
+    auto_stage1_scanned = 0
+    auto_stage1_matched = 0
+    auto_stage1_applied = 0
+    auto_stage2_scanned = 0
+    auto_stage2_matched = 0
+    auto_stage2_applied = 0
+    provider_raw = str(os.getenv("RT_AUTO_ENRICH_PROVIDERS", "musicbrainz,discogs,acoustid"))
+    auto_providers = [p.strip().lower() for p in provider_raw.split(",") if p.strip()]
+    if not auto_providers:
+        auto_providers = ["musicbrainz", "discogs", "acoustid"]
     if auto_enrich_enabled and auto_enrich_candidates:
         try:
             auto_limit = int(os.getenv("RT_AUTO_ENRICH_SCAN_LIMIT", "12"))
@@ -820,36 +1462,81 @@ def submit_scan(payload: ScanPayload):
         except Exception:
             auto_min_score = 0.72
         auto_min_score = max(0.0, min(auto_min_score, 1.0))
-        provider_raw = str(os.getenv("RT_AUTO_ENRICH_PROVIDERS", "musicbrainz,discogs,acoustid"))
-        auto_providers = [p.strip().lower() for p in provider_raw.split(",") if p.strip()]
-        if not auto_providers:
-            auto_providers = ["musicbrainz", "discogs", "acoustid"]
+        # Stage 1: text metadata providers first (default: musicbrainz,discogs)
+        # Stage 2: acoustid fallback only for stage-1 misses.
+        stage1_providers = [p for p in auto_providers if p != "acoustid"]
+        stage2_enabled = "acoustid" in auto_providers
+        try:
+            stage2_limit = int(os.getenv("RT_AUTO_ENRICH_ACOUSTID_LIMIT", "8"))
+        except Exception:
+            stage2_limit = 8
+        stage2_limit = max(0, min(stage2_limit, auto_limit))
 
-        for tid in auto_enrich_candidates[:auto_limit]:
+        stage1_ids = auto_enrich_candidates[:auto_limit]
+        stage2_candidates: list[str] = []
+
+        def _attempt_auto_apply(tid: str, providers: list[str], stage: str) -> bool:
+            nonlocal auto_scanned, auto_matched, auto_applied
+            nonlocal auto_stage1_scanned, auto_stage1_matched, auto_stage1_applied
+            nonlocal auto_stage2_scanned, auto_stage2_matched, auto_stage2_applied
             tcur = tracks.get(tid)
             if not tcur:
-                continue
+                return False
             auto_scanned += 1
+            if stage == "stage1":
+                auto_stage1_scanned += 1
+            else:
+                auto_stage2_scanned += 1
             tcur["_auto_enrich_ts"] = now_ts
-            searched = search_candidates(tcur, providers=auto_providers, include_errors=True)
+            searched = search_candidates(tcur, providers=providers, include_errors=True)
             candidates = searched.get("candidates", [])
             if not candidates:
-                continue
+                return False
             best = candidates[0]
             db_insert_provider_snapshot(tid, best)
             score = float(best.get("score") or 0.0)
-            if score < auto_min_score:
-                continue
+            min_for_provider = _provider_min_score(str(best.get("provider") or ""), auto_min_score)
+            if score < min_for_provider:
+                return False
+            if not _candidate_passes_sanity(tcur, best):
+                return False
+            if not _overwrite_allowed(tcur, best, mode="auto"):
+                return False
             auto_matched += 1
+            if stage == "stage1":
+                auto_stage1_matched += 1
+            else:
+                auto_stage2_matched += 1
             patch = best.get("patch") or {}
             patched = dict(tcur)
             patched.update(patch)
+            patched["metadata_source"] = f"auto:{str(best.get('provider') or 'unknown')}"
+            patched["metadata_source_score"] = score
+            patched["metadata_source_updated_at"] = now_ts
             patched.update(enrich_track_metadata(patched))
             if any(tcur.get(k) != patched.get(k) for k in patched.keys()):
                 tracks[tid] = patched
                 db_upsert_tracks(payload.user_id, [patched])
                 db_upsert_override(tid, payload.user_id, patch)
                 auto_applied += 1
+                if stage == "stage1":
+                    auto_stage1_applied += 1
+                else:
+                    auto_stage2_applied += 1
+                return True
+            return True
+
+        for tid in stage1_ids:
+            if stage1_providers:
+                ok = _attempt_auto_apply(tid, stage1_providers, "stage1")
+            else:
+                ok = False
+            if not ok and stage2_enabled:
+                stage2_candidates.append(tid)
+
+        if stage2_enabled:
+            for tid in stage2_candidates[:stage2_limit]:
+                _attempt_auto_apply(tid, ["acoustid"], "stage2")
         if auto_applied > 0:
             save_lib(payload.user_id, lib)
 
@@ -871,6 +1558,19 @@ def submit_scan(payload: ScanPayload):
             "scanned": auto_scanned,
             "matched": auto_matched,
             "applied": auto_applied,
+            "stage1": {
+                "providers": [p for p in auto_providers if p != "acoustid"],
+                "scanned": auto_stage1_scanned,
+                "matched": auto_stage1_matched,
+                "applied": auto_stage1_applied,
+            },
+            "stage2": {
+                "providers": ["acoustid"] if "acoustid" in auto_providers else [],
+                "scanned": auto_stage2_scanned,
+                "matched": auto_stage2_matched,
+                "applied": auto_stage2_applied,
+            },
+            "seed_enabled": seed_enabled,
         },
         "preview": preview
     }
@@ -883,8 +1583,16 @@ def relay(user_id: str, track_id: str, request: Request):
     if not track:
         raise HTTPException(status_code=404, detail="Unknown track_id")
 
+    # Legacy fast path for FLAC/legacy codecs: avoid extra upstream probe/redirect hops.
+    if _track_needs_mp3_proxy(track):
+        target_url = str(request.url_for("relay_mp3", user_id=user_id, track_id=track_id))
+        if request.url.query:
+            target_url = f"{target_url}?{request.url.query}"
+        return RedirectResponse(url=target_url, status_code=302)
+
     url = build_stream_url(user_id, track)
     if not url:
+        _mark_track_playability(user_id, track_id, ok=False, reason="no-base-url-or-rel-path")
         raise HTTPException(status_code=503, detail="Agent offline or base_url/rel_path unknown")
 
     client_range = request.headers.get("range")
@@ -924,6 +1632,7 @@ def relay(user_id: str, track_id: str, request: Request):
         )
     except requests.RequestException as e:
         print(f"[relay] upstream error user={user_id} track={track_id} url={url} err={e}")
+        _mark_track_playability(user_id, track_id, ok=False, reason=f"upstream-fetch-failed:{e}")
         raise HTTPException(status_code=502, detail=f"Upstream fetch failed: {e}")
     
     # If client sent Range but upstream rejects it (416), retry once without Range.
@@ -953,6 +1662,7 @@ def relay(user_id: str, track_id: str, request: Request):
         except Exception:
             pass
         print(f"[relay] upstream HTTP {status} user={user_id} track={track_id} url={url} body={body_preview!r}")
+        _mark_track_playability(user_id, track_id, ok=False, reason=f"upstream-http-{status}")
         raise HTTPException(status_code=status, detail=f"Upstream returned {status}")
 
     passthrough: Dict[str, str] = {}
@@ -1006,6 +1716,8 @@ def relay(user_id: str, track_id: str, request: Request):
             pass
         return Response(status_code=status, headers=passthrough, media_type=media)
 
+    _mark_track_playability(user_id, track_id, ok=True)
+
     def gen():
         try:
             for chunk in upstream.iter_content(chunk_size=256 * 1024):
@@ -1028,6 +1740,7 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
 
     url = build_stream_url(user_id, track)
     if not url:
+        _mark_track_playability(user_id, track_id, ok=False, reason="no-base-url-or-rel-path")
         raise HTTPException(status_code=503, detail="Agent offline or base_url/rel_path unknown")
 
     # Best-effort duration (helps iOS display track length)
@@ -1058,12 +1771,41 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
         # Approximate size for CBR MP3: seconds * (kbps * 1000 / 8)
         est_len = int(duration_sec * (abr_kbps * 1000 / 8))
 
+    cache_enabled = _env_bool("RT_MP3_CACHE_ENABLED", default=False)
+    cache_strict = _env_bool("RT_MP3_CACHE_STRICT", default=False)
+    if cache_enabled:
+        cached_path = _try_build_cached_mp3(
+            user_id=user_id,
+            track_id=track_id,
+            src_url=url,
+            abr_kbps=abr_kbps,
+        )
+        if cached_path:
+            print(f"[relay-mp3] mode=cached user={user_id} track={track_id} file={cached_path}")
+            if request.method != "HEAD":
+                _mark_track_playability(user_id, track_id, ok=True)
+            return _serve_mp3_file(
+                path=cached_path,
+                request=request,
+                duration_sec=duration_sec,
+                abr_kbps=abr_kbps,
+                start_sec=start_sec,
+            )
+        print(f"[relay-mp3] mode=live-fallback user={user_id} track={track_id} reason=cache-miss-or-build-failed")
+        if cache_strict:
+            _mark_track_playability(user_id, track_id, ok=False, reason="cache-strict-no-cache")
+            raise HTTPException(
+                status_code=503,
+                detail="cache-backed relay enabled but cache build unavailable; strict mode blocks live fallback",
+            )
+
     if request.method == "HEAD":
         headers = {
             "Access-Control-Allow-Origin": "*",
             "Cache-Control": "no-store, must-revalidate, no-transform",
             "Content-Type": "audio/mpeg",
             "Accept-Ranges": "none",
+            "X-Relay-Mode": "live-transcode",
         }
         if duration_sec:
             headers["X-Content-Duration"] = str(duration_sec)
@@ -1082,6 +1824,7 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
             bufsize=0,
         )
     except Exception as e:
+        _mark_track_playability(user_id, track_id, ok=False, reason=f"ffmpeg-spawn-failed:{e}")
         raise HTTPException(status_code=500, detail=f"ffmpeg spawn failed: {e}")
 
     def gen():
@@ -1111,4 +1854,5 @@ def relay_mp3(user_id: str, track_id: str, request: Request):
     # Do not set guessed Content-Length on live transcode GET responses.
     # Estimated lengths can cause premature end behavior on some clients.
 
+    _mark_track_playability(user_id, track_id, ok=True)
     return StreamingResponse(gen(), media_type="audio/mpeg", headers=headers)

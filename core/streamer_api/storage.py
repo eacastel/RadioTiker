@@ -217,6 +217,57 @@ def db_upsert_override(track_uid: str, user_id: str, patch: Dict[str, Any]) -> b
         return False
 
 
+def db_delete_overrides(user_id: str, track_ids: List[str]) -> bool:
+    conn = _db_conn()
+    if not conn or not track_ids:
+        return False
+    placeholders = ",".join(["%s"] * len(track_ids))
+    sql = f"DELETE FROM metadata_overrides WHERE user_id = %s AND track_uid IN ({placeholders})"
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple([user_id] + [str(tid) for tid in track_ids]))
+        return True
+    except Exception as e:
+        print(f"[db] delete overrides failed user={user_id}: {e}")
+        return False
+
+
+def db_delete_provider_snapshots(track_ids: List[str]) -> bool:
+    conn = _db_conn()
+    if not conn or not track_ids:
+        return False
+    placeholders = ",".join(["%s"] * len(track_ids))
+    sql = f"DELETE FROM provider_snapshots WHERE track_uid IN ({placeholders})"
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(str(tid) for tid in track_ids))
+        return True
+    except Exception as e:
+        print(f"[db] delete provider snapshots failed: {e}")
+        return False
+
+
+def db_delete_tracks(user_id: str, track_ids: List[str], purge_related: bool = True) -> bool:
+    conn = _db_conn()
+    if not conn or not track_ids:
+        return False
+    placeholders = ",".join(["%s"] * len(track_ids))
+    sql = f"DELETE FROM tracks WHERE user_id = %s AND track_uid IN ({placeholders})"
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple([user_id] + [str(tid) for tid in track_ids]))
+        if purge_related:
+            db_delete_overrides(user_id, track_ids)
+            db_delete_provider_snapshots(track_ids)
+        return True
+    except Exception as e:
+        print(f"[db] delete tracks failed user={user_id}: {e}")
+        return False
+
+
 def db_find_metadata_seed(user_id: str, track: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
     Find best same-user historical metadata row for this track by normalized keys.

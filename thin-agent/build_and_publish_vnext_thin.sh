@@ -25,7 +25,9 @@ pip install --upgrade pip
 pip install -r requirements.txt pyinstaller
 
 rm -rf build dist *.spec
-pyinstaller thin_agent.py --onefile --name "${BIN_NAME}"
+# Build GUI-capable agent binary. On Linux without DISPLAY it auto-falls back
+# to headless mode (handled inside thin_agent_gui.py).
+pyinstaller thin_agent_gui.py --onefile --name "${BIN_NAME}"
 
 tar -czf "${TGZ_NAME}" -C dist "${BIN_NAME}"
 

@@ -29,6 +29,8 @@ class Track(BaseModel):
     format_family: Optional[str] = None
     metadata_quality: Optional[int] = None
     metadata_flags: Optional[List[str]] = None
+    metadata_source: Optional[str] = None
+    metadata_source_score: Optional[float] = None
     search_text: Optional[str] = None
     artwork_url: Optional[str] = None
     artwork_urls: Optional[List[str]] = None
@@ -83,3 +85,9 @@ class MetadataEnrichLibraryPayload(BaseModel):
     apply: Optional[bool] = False
     providers: Optional[List[str]] = None
     min_score: Optional[float] = 0.78
+
+
+class MetadataResetPayload(BaseModel):
+    track_ids: Optional[List[str]] = None
+    clear_provider_snapshots: Optional[bool] = False
+    clear_overrides: Optional[bool] = False

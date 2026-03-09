@@ -25,6 +25,7 @@ Options:
   --agent-bin <path>      Agent binary path (default: ./radiotiker-thin-agent-vnext-latest-linux)
   --autostart             Install/update systemd user auto-start service (opt-in)
   --run                   Start thin_agent.py after writing env
+  --gui                   Start thin_agent_gui.py after writing env (implies --run)
   --help                  Show this help
 EOF
 }
@@ -39,6 +40,7 @@ ENV_FILE=".env"
 AGENT_BIN="./radiotiker-thin-agent-vnext-latest-linux"
 INSTALL_AUTOSTART=0
 RUN_AFTER=0
+GUI_AFTER=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --agent-bin) AGENT_BIN="${2:-}"; shift 2 ;;
     --autostart) INSTALL_AUTOSTART=1; shift 1 ;;
     --run) RUN_AFTER=1; shift 1 ;;
+    --gui) GUI_AFTER=1; RUN_AFTER=1; shift 1 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -219,6 +222,7 @@ USER_ID=${USER_ID}
 LIBRARY_PATH=${LIBRARY_PATH}
 AGENT_PORT=${AGENT_PORT}
 VALID_AUDIO_EXTENSIONS=.mp3,.flac,.wav,.m4a
+ENABLE_ACOUSTID_SCAN=${ENABLE_ACOUSTID_SCAN:-0}
 PUBLIC_BASE_URL=${PUBLIC_BASE_URL}
 
 TUNNEL_ENABLE=1
@@ -251,6 +255,9 @@ echo "env_file=${ENV_FILE}"
 echo "To run agent:"
 echo "  set -a; source ${ENV_FILE}; set +a"
 echo "  python3 thin_agent.py"
+if [[ -f "thin_agent_gui.py" ]]; then
+  echo "  python3 thin_agent_gui.py   # GUI mode"
+fi
 
 if [[ "${RUN_AFTER}" -eq 1 ]]; then
   echo "-- starting agent"
@@ -265,6 +272,9 @@ if [[ "${RUN_AFTER}" -eq 1 ]]; then
   # shellcheck source=/dev/null
   source "${ENV_FILE}"
   set +a
+  if [[ "${GUI_AFTER}" -eq 1 ]] && [[ -f "thin_agent_gui.py" ]]; then
+    exec python3 thin_agent_gui.py
+  fi
   if [[ -f "thin_agent.py" ]]; then
     exec python3 thin_agent.py
   fi

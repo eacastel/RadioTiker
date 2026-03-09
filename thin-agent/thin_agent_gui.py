@@ -24,6 +24,7 @@ load_dotenv()
 API_BASE    = os.getenv("SERVER_BASE", "https://next.radio.tiker.es/streamer/api/")
 SUBMIT_URL  = urljoin(API_BASE, "submit-scan")
 ANNOUNCE_URL= urljoin(API_BASE, "agent/announce")
+ENRICH_URL_BASE = urljoin(API_BASE, "metadata/enrich-library/")
 
 CONF_DIR  = Path.home() / ".radiotiker"
 CONF_DIR.mkdir(parents=True, exist_ok=True)
@@ -77,6 +78,23 @@ VALID_EXTENSIONS = tuple(
 DEFAULT_PORT     = int(os.getenv("AGENT_PORT", "8765"))
 PUBLIC_BASE_URL  = os.getenv("PUBLIC_BASE_URL")  # optional tunnel override
 ENABLE_ACOUSTID_SCAN = str(os.getenv("ENABLE_ACOUSTID_SCAN", "0")).strip().lower() in {"1", "true", "yes", "on"}
+SCAN_BATCH_SIZE = max(25, int(os.getenv("RT_SCAN_BATCH_SIZE", "50") or "50"))
+SCAN_SUBMIT_TIMEOUT_SEC = max(15, int(os.getenv("RT_SCAN_SUBMIT_TIMEOUT_SEC", "180") or "180"))
+SCAN_SUBMIT_RETRIES = max(1, int(os.getenv("RT_SCAN_SUBMIT_RETRIES", "3") or "3"))
+SCAN_RETRY_BACKOFF_SEC = max(1.0, float(os.getenv("RT_SCAN_RETRY_BACKOFF_SEC", "2") or "2"))
+SCAN_RESUME_ENABLED = str(os.getenv("RT_SCAN_RESUME_ENABLED", "1")).strip().lower() in {"1", "true", "yes", "on"}
+SCAN_RESUME_RESET = str(os.getenv("RT_SCAN_RESUME_RESET", "0")).strip().lower() in {"1", "true", "yes", "on"}
+POST_SCAN_ENRICH_ENABLED = str(os.getenv("RT_POST_SCAN_ENRICH_ENABLED", "0")).strip().lower() in {"1", "true", "yes", "on"}
+POST_SCAN_ENRICH_LIMIT = max(20, int(os.getenv("RT_POST_SCAN_ENRICH_LIMIT", "300") or "300"))
+POST_SCAN_ENRICH_MAX_PASSES = max(1, int(os.getenv("RT_POST_SCAN_ENRICH_MAX_PASSES", "25") or "25"))
+POST_SCAN_ENRICH_MIN_SCORE = float(os.getenv("RT_POST_SCAN_ENRICH_MIN_SCORE", "0.88") or "0.88")
+POST_SCAN_ENRICH_APPLY = str(os.getenv("RT_POST_SCAN_ENRICH_APPLY", "1")).strip().lower() in {"1", "true", "yes", "on"}
+POST_SCAN_ENRICH_TIMEOUT_SEC = max(15, int(os.getenv("RT_POST_SCAN_ENRICH_TIMEOUT_SEC", "180") or "180"))
+POST_SCAN_ENRICH_PROVIDERS = [
+    p.strip().lower()
+    for p in os.getenv("RT_POST_SCAN_ENRICH_PROVIDERS", "musicbrainz,discogs,acoustid").split(",")
+    if p.strip()
+]
 
 # ---------- identity ----------
 def get_user_id_interactive(default_val="user-001"):
@@ -106,6 +124,35 @@ def load_or_prompt_user_id():
     return uid
 
 USER_ID = load_or_prompt_user_id()
+
+
+def _scan_resume_file(user_id: str) -> Path:
+    return CONF_DIR / f"scan_resume_{user_id}.json"
+
+
+def _load_scan_resume(user_id: str) -> dict:
+    p = _scan_resume_file(user_id)
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def _save_scan_resume(user_id: str, data: dict):
+    p = _scan_resume_file(user_id)
+    try:
+        p.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
+def _iter_audio_files(folder_path: str):
+    root_abs = os.path.abspath(folder_path)
+    for root, dirs, files in os.walk(root_abs):
+        dirs.sort()
+        for fname in sorted(files):
+            if fname.lower().endswith(VALID_EXTENSIONS):
+                yield os.path.join(root, fname)
 
 # ---------- utils ----------
 def _file_fingerprint(path: str) -> tuple[int, int]:
@@ -234,6 +281,57 @@ def announce_agent(user_id: str, base_url: str, log_fn):
     except Exception as e:
         log_fn(f"❌ Announce failed: {e}\n")
 
+
+def run_post_scan_enrichment(user_id: str, log_fn):
+    if not POST_SCAN_ENRICH_ENABLED:
+        return
+    if not POST_SCAN_ENRICH_PROVIDERS:
+        log_fn("ℹ️ Post-scan enrich skipped: no providers configured.\n")
+        return
+    url = f"{ENRICH_URL_BASE.rstrip('/')}/{user_id}"
+    log_fn(
+        "🧠 Post-scan enrich started: "
+        f"providers={POST_SCAN_ENRICH_PROVIDERS} "
+        f"limit={POST_SCAN_ENRICH_LIMIT} "
+        f"max_passes={POST_SCAN_ENRICH_MAX_PASSES} "
+        f"min_score={POST_SCAN_ENRICH_MIN_SCORE} "
+        f"apply={POST_SCAN_ENRICH_APPLY}\n"
+    )
+    total_scanned = 0
+    total_matched = 0
+    total_applied = 0
+    for i in range(1, POST_SCAN_ENRICH_MAX_PASSES + 1):
+        payload = {
+            "limit": POST_SCAN_ENRICH_LIMIT,
+            "apply": POST_SCAN_ENRICH_APPLY,
+            "providers": POST_SCAN_ENRICH_PROVIDERS,
+            "min_score": POST_SCAN_ENRICH_MIN_SCORE,
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=POST_SCAN_ENRICH_TIMEOUT_SEC)
+            if r.status_code >= 400:
+                log_fn(f"⚠️ Post-scan enrich pass {i} failed: HTTP {r.status_code} {r.text[:200]}\n")
+                break
+            j = r.json()
+            scanned = int(j.get("scanned") or 0)
+            matched = int(j.get("matched") or 0)
+            applied = int(j.get("applied") or 0)
+            total_scanned += scanned
+            total_matched += matched
+            total_applied += applied
+            log_fn(f"🧠 Enrich pass {i}: scanned={scanned} matched={matched} applied={applied}\n")
+            if scanned < POST_SCAN_ENRICH_LIMIT:
+                break
+            if matched == 0 and applied == 0:
+                break
+        except Exception as e:
+            log_fn(f"⚠️ Post-scan enrich pass {i} error: {e}\n")
+            break
+    log_fn(
+        "✅ Post-scan enrich completed: "
+        f"scanned={total_scanned} matched={total_matched} applied={total_applied}\n"
+    )
+
 def scan_folder(folder_path, log_fn, stop_event: threading.Event | None = None):
     lib = []
     # pre-count (nice progress)
@@ -317,7 +415,7 @@ def send_in_batches(
     user_id: str,
     tracks: list,
     log_fn,
-    batch_size=300,
+    batch_size=SCAN_BATCH_SIZE,
     replace=False,
     stop_event: threading.Event | None = None,
 ):
@@ -337,12 +435,276 @@ def send_in_batches(
             "library_version": version,
             "replace": bool(replace and i == 0),  # clear on FIRST batch only
         }
-        try:
-            r = requests.post(SUBMIT_URL, json=payload, timeout=90)
-            log_fn(f"✅ Batch {i+1}-{i+len(chunk)} / {total} → {r.status_code} {r.text[:200]}\n")
-        except Exception as e:
-            log_fn(f"❌ Batch {i+1}-{i+len(chunk)} failed: {e}\n")
+        ok = False
+        last_err = None
+        for attempt in range(1, SCAN_SUBMIT_RETRIES + 1):
+            try:
+                r = requests.post(SUBMIT_URL, json=payload, timeout=SCAN_SUBMIT_TIMEOUT_SEC)
+                if r.status_code >= 400:
+                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:240]}")
+                log_fn(f"✅ Batch {i+1}-{i+len(chunk)} / {total} → {r.status_code} {r.text[:200]}\n")
+                ok = True
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < SCAN_SUBMIT_RETRIES:
+                    wait = SCAN_RETRY_BACKOFF_SEC * attempt
+                    log_fn(
+                        f"⚠️ Batch {i+1}-{i+len(chunk)} attempt {attempt}/{SCAN_SUBMIT_RETRIES} failed: {e}. "
+                        f"Retrying in {wait:.0f}s...\n"
+                    )
+                    time.sleep(wait)
+        if not ok:
+            log_fn(
+                f"❌ Batch {i+1}-{i+len(chunk)} failed after {SCAN_SUBMIT_RETRIES} attempts: {last_err}\n"
+            )
             break
+
+
+def _post_scan_chunk(
+    user_id: str,
+    chunk: list,
+    version: int,
+    replace: bool,
+    log_fn,
+    range_start: int,
+    range_end: int,
+    total: int,
+) -> bool:
+    payload = {
+        "user_id": user_id,
+        "library": chunk,
+        "library_version": version,
+        "replace": bool(replace),
+    }
+    last_err = None
+    for attempt in range(1, SCAN_SUBMIT_RETRIES + 1):
+        try:
+            r = requests.post(SUBMIT_URL, json=payload, timeout=SCAN_SUBMIT_TIMEOUT_SEC)
+            if r.status_code >= 400:
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:240]}")
+            log_fn(f"✅ Batch {range_start}-{range_end} / {total} → {r.status_code} {r.text[:200]}\n")
+            return True
+        except Exception as e:
+            last_err = e
+            if attempt < SCAN_SUBMIT_RETRIES:
+                wait = SCAN_RETRY_BACKOFF_SEC * attempt
+                log_fn(
+                    f"⚠️ Batch {range_start}-{range_end} attempt {attempt}/{SCAN_SUBMIT_RETRIES} failed: {e}. "
+                    f"Retrying in {wait:.0f}s...\n"
+                )
+                time.sleep(wait)
+    log_fn(f"❌ Batch {range_start}-{range_end} failed after {SCAN_SUBMIT_RETRIES} attempts: {last_err}\n")
+    return False
+
+
+def scan_and_send_incremental(
+    user_id: str,
+    folder_path: str,
+    log_fn,
+    batch_size: int = SCAN_BATCH_SIZE,
+    replace: bool = False,
+    stop_event: threading.Event | None = None,
+):
+    root_abs = os.path.abspath(folder_path)
+    version = int(time.time())
+    candidates = list(_iter_audio_files(root_abs))
+    total = len(candidates)
+    resume_state = {}
+    resume_from = 0
+    replace_next = bool(replace)
+    uploaded = 0
+    failed = False
+
+    if stop_event and stop_event.is_set():
+        log_fn("⚠️ Scan cancelled.\n")
+        return {"scanned": 0, "uploaded": 0, "failed": False}
+
+    if SCAN_RESUME_ENABLED:
+        if SCAN_RESUME_RESET:
+            try:
+                _scan_resume_file(user_id).unlink()
+                log_fn("♻️ Scan resume checkpoint reset.\n")
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+        resume_state = _load_scan_resume(user_id)
+        if (
+            resume_state.get("folder_path") == root_abs
+            and not bool(resume_state.get("completed", False))
+        ):
+            resume_from = max(0, int(resume_state.get("committed_scanned", 0) or 0))
+            uploaded = max(0, int(resume_state.get("uploaded", 0) or 0))
+            replace_next = bool(resume_state.get("replace_next", replace))
+            if resume_from > 0:
+                log_fn(f"↩️ Resuming scan from {resume_from}/{total} committed files.\n")
+        else:
+            resume_state = {
+                "user_id": user_id,
+                "folder_path": root_abs,
+                "version": version,
+                "total_candidates": total,
+                "committed_scanned": 0,
+                "uploaded": 0,
+                "replace_next": bool(replace),
+                "completed": False,
+                "updated_at": int(time.time()),
+            }
+            _save_scan_resume(user_id, resume_state)
+
+    log_fn(f"Scanning folder: {root_abs}\nTotal candidates: {total}\n")
+    scanned = resume_from
+    chunk: list[dict] = []
+    for idx in range(resume_from, total):
+        if stop_event and stop_event.is_set():
+            log_fn("⚠️ Scan cancelled.\n")
+            return {"scanned": scanned, "uploaded": uploaded, "failed": failed}
+        full_path = candidates[idx]
+        fname = os.path.basename(full_path)
+        try:
+            size, mtime = _file_fingerprint(full_path)
+
+            easy = MutagenFile(full_path, easy=True)
+            title_default = os.path.splitext(fname)[0]
+            title = _first_tag(easy, "title", title_default)
+            artist = _first_tag(easy, "artist", "Unknown")
+            album = _first_tag(easy, "album", "Unknown")
+            album_artist = _first_tag(easy, "albumartist")
+            genre = _first_tag(easy, "genre")
+            year = _parse_first_int(_first_tag(easy, "date"))
+            track_no = _parse_first_int(_first_tag(easy, "tracknumber"))
+            disc_no = _parse_first_int(_first_tag(easy, "discnumber"))
+            composer = _first_tag(easy, "composer")
+            bpm = _parse_float(_first_tag(easy, "bpm"))
+            musical_key = _first_tag(easy, "initialkey") or _first_tag(easy, "key")
+            codec, sample_rate, bit_depth, bitrate_kbps, channels = _technical_info(full_path)
+            dur = _duration_seconds(full_path)
+            acoustid_fp, acoustid_dur = _acoustid_fingerprint(full_path)
+            rel = os.path.relpath(full_path, root_abs).replace(os.sep, "/")
+
+            chunk.append({
+                "title": title,
+                "artist": artist,
+                "album": album,
+                "album_artist": album_artist,
+                "genre": genre,
+                "year": year,
+                "track_no": track_no,
+                "disc_no": disc_no,
+                "composer": composer,
+                "bpm": bpm,
+                "musical_key": musical_key,
+                "codec": codec,
+                "sample_rate": sample_rate,
+                "bit_depth": bit_depth,
+                "bitrate_kbps": bitrate_kbps,
+                "channels": channels,
+                "path": full_path,
+                "rel_path": rel,
+                "file_size": size,
+                "mtime": mtime,
+                "duration_sec": dur,
+                "acoustid_fingerprint": acoustid_fp,
+                "acoustid_duration": acoustid_dur,
+                "track_id": _track_id(full_path, size, mtime),
+            })
+            scanned += 1
+            if scanned % 25 == 0 or scanned == total:
+                log_fn(f"  • Scanned {scanned}/{total} ...\n")
+
+            if len(chunk) >= batch_size:
+                start = scanned - len(chunk) + 1
+                end = scanned
+                if not _post_scan_chunk(
+                    user_id=user_id,
+                    chunk=chunk,
+                    version=version,
+                    replace=replace_next,
+                    log_fn=log_fn,
+                    range_start=start,
+                    range_end=end,
+                    total=total,
+                ):
+                    failed = True
+                    if SCAN_RESUME_ENABLED:
+                        _save_scan_resume(user_id, {
+                            "user_id": user_id,
+                            "folder_path": root_abs,
+                            "version": version,
+                            "total_candidates": total,
+                            "committed_scanned": scanned - len(chunk),
+                            "uploaded": uploaded,
+                            "replace_next": replace_next,
+                            "completed": False,
+                            "updated_at": int(time.time()),
+                        })
+                    log_fn(f"⏸️ Paused after failed batch {start}-{end}; restart will resume.\n")
+                    return {"scanned": scanned, "uploaded": uploaded, "failed": True}
+                replace_next = False
+                uploaded += len(chunk)
+                if SCAN_RESUME_ENABLED:
+                    _save_scan_resume(user_id, {
+                        "user_id": user_id,
+                        "folder_path": root_abs,
+                        "version": version,
+                        "total_candidates": total,
+                        "committed_scanned": scanned,
+                        "uploaded": uploaded,
+                        "replace_next": replace_next,
+                        "completed": False,
+                        "updated_at": int(time.time()),
+                    })
+                chunk = []
+        except Exception as e:
+            log_fn(f"❌ {full_path}: {e}\n")
+
+    if chunk:
+        start = scanned - len(chunk) + 1
+        end = scanned
+        if not _post_scan_chunk(
+            user_id=user_id,
+            chunk=chunk,
+            version=version,
+            replace=replace_next,
+            log_fn=log_fn,
+            range_start=start,
+            range_end=end,
+            total=total,
+        ):
+            failed = True
+            if SCAN_RESUME_ENABLED:
+                _save_scan_resume(user_id, {
+                    "user_id": user_id,
+                    "folder_path": root_abs,
+                    "version": version,
+                    "total_candidates": total,
+                    "committed_scanned": scanned - len(chunk),
+                    "uploaded": uploaded,
+                    "replace_next": replace_next,
+                    "completed": False,
+                    "updated_at": int(time.time()),
+                })
+            log_fn(f"⏸️ Final partial batch {start}-{end} failed; restart will resume.\n")
+            return {"scanned": scanned, "uploaded": uploaded, "failed": True}
+        else:
+            replace_next = False
+            uploaded += len(chunk)
+
+    if SCAN_RESUME_ENABLED:
+        _save_scan_resume(user_id, {
+            "user_id": user_id,
+            "folder_path": root_abs,
+            "version": version,
+            "total_candidates": total,
+            "committed_scanned": scanned,
+            "uploaded": uploaded,
+            "replace_next": False,
+            "completed": True,
+            "updated_at": int(time.time()),
+        })
+
+    return {"scanned": scanned, "uploaded": uploaded, "failed": failed}
 
 def _remember_root(path: str):
     st = read_state()
@@ -610,25 +972,28 @@ class AgentGUI:
 
         def work():
             try:
-                tracks = scan_folder(path, self.log, stop_event=self._scan_stop)
-                if self._scan_stop and self._scan_stop.is_set():
-                    self.status_var.set("Status: scan cancelled")
-                    return
-
-                self.log(f"🎵 Found {len(tracks)} valid audio files.\n")
-                _remember_root(path)
-
-                # Send in batches; only the FIRST batch includes replace=True when requested
-                send_in_batches(
+                result = scan_and_send_incremental(
                     USER_ID,
-                    tracks,
+                    path,
                     self.log,
-                    batch_size=500,
+                    batch_size=SCAN_BATCH_SIZE,
                     replace=replacing,
                     stop_event=self._scan_stop,
                 )
                 if self._scan_stop and self._scan_stop.is_set():
+                    self.status_var.set("Status: scan cancelled")
+                    return
+                self.log(
+                    f"🎵 Scan complete. valid={result['scanned']} uploaded={result['uploaded']} "
+                    f"failed={'yes' if result['failed'] else 'no'}\n"
+                )
+                if not result["failed"] and result["uploaded"] > 0:
+                    run_post_scan_enrichment(USER_ID, self.log)
+                _remember_root(path)
+                if self._scan_stop and self._scan_stop.is_set():
                     self.status_var.set("Status: upload cancelled")
+                elif result["failed"]:
+                    self.status_var.set("Status: connected (partial upload)")
                 else:
                     self.status_var.set("Status: connected (scanned)")
             finally:
@@ -652,9 +1017,19 @@ def run_headless():
     announce_agent(USER_ID, base, print)
     # remember root
     st = read_state(); st["last_root"] = path; write_state(st)
-    tracks = scan_folder(path, print)
-    print(f"🎵 Found {len(tracks)} tracks. Sending to server in batches…")
-    send_in_batches(USER_ID, tracks, print, batch_size=500, replace=False)
+    result = scan_and_send_incremental(
+        USER_ID,
+        path,
+        print,
+        batch_size=SCAN_BATCH_SIZE,
+        replace=False,
+    )
+    print(
+        f"🎵 Scan complete. valid={result['scanned']} uploaded={result['uploaded']} "
+        f"failed={'yes' if result['failed'] else 'no'}"
+    )
+    if not result["failed"] and result["uploaded"] > 0:
+        run_post_scan_enrichment(USER_ID, print)
     print("✅ Done. Press Ctrl+C to quit; server stays up so streaming works.")
     try:
         while True: time.sleep(3600)

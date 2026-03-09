@@ -38,10 +38,36 @@
       padding-left: 20px;
       line-height: 1.8;
     }
+    ol {
+      margin: 0;
+      padding-left: 20px;
+      line-height: 1.8;
+    }
     code {
       background: #1f2937;
       padding: 2px 6px;
       border-radius: 6px;
+    }
+    pre {
+      margin: 10px 0 0;
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 12px;
+      overflow-x: auto;
+      color: #e2e8f0;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .section {
+      margin-top: 18px;
+      padding-top: 14px;
+      border-top: 1px solid #243244;
+    }
+    .label {
+      font-weight: 700;
+      margin-bottom: 6px;
+      color: #dbeafe;
     }
   </style>
 </head>
@@ -67,13 +93,37 @@
         <a href="/streamer/api/health">/streamer/api/health</a>
       </li>
     </ul>
-    <p style="margin-top:16px">
-      Usage:
-      <code>curl -LO https://radio.tiker.es/downloads/radiotiker-thin-agent-vnext-latest-linux</code><br>
-      <code>curl -LO https://radio.tiker.es/downloads/radiotiker-vnext-onboard-latest.sh</code><br>
-      <code>chmod +x radiotiker-thin-agent-vnext-latest-linux radiotiker-vnext-onboard-latest.sh</code><br>
-      <code>./radiotiker-vnext-onboard-latest.sh --user-id &lt;user&gt; --library-path &lt;path&gt; --run</code>
-    </p>
+
+    <div class="section">
+      <div class="label">Linux onboarding path A (click links in browser)</div>
+      <ol>
+        <li>Click both download links above.</li>
+        <li>Open terminal and run:</li>
+      </ol>
+      <pre><code>cd ~/Downloads
+chmod +x radiotiker-thin-agent-vnext-latest-linux radiotiker-vnext-onboard-latest.sh
+mv radiotiker-thin-agent-vnext-latest-linux radiotiker-vnext-onboard-latest.sh ~/
+cd ~
+ENABLE_ACOUSTID_SCAN=1 ./radiotiker-vnext-onboard-latest.sh --user-id &lt;user&gt; --library-path "&lt;path&gt;" --gui</code></pre>
+    </div>
+
+    <div class="section">
+      <div class="label">Linux onboarding path B (copy/paste with curl)</div>
+      <pre><code>cd ~
+curl -fLO https://radio.tiker.es/downloads/radiotiker-thin-agent-vnext-latest-linux
+curl -fLO https://radio.tiker.es/downloads/radiotiker-vnext-onboard-latest.sh
+chmod +x radiotiker-thin-agent-vnext-latest-linux radiotiker-vnext-onboard-latest.sh
+ENABLE_ACOUSTID_SCAN=1 ./radiotiker-vnext-onboard-latest.sh --user-id &lt;user&gt; --library-path "&lt;path&gt;" --gui</code></pre>
+    </div>
+
+    <div class="section">
+      <div class="label">Notes</div>
+      <ul>
+        <li><code>--gui</code> launches the Tk GUI after onboarding; <code>--run</code> launches headless mode.</li>
+        <li><code>ENABLE_ACOUSTID_SCAN=1</code> enables fingerprint collection when <code>fpcalc</code> is available.</li>
+        <li>For very large libraries, batching/retry is automatic; tracks will trickle into player/library while scan continues.</li>
+      </ul>
+    </div>
   </div>
 </body>
 </html>
