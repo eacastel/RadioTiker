@@ -31,9 +31,30 @@ Goals: scalable catalog, metadata normalization, station curation, and plan gati
 - `created_at` (timestamptz)
 
 ### tracks
-Represents a unique file instance discovered by an agent.
+Represents a canonical logical track chosen for playback/search/metadata.
 
 - `id` (uuid, pk)
+- `user_id` (uuid, fk → users.id)
+- `canonical_key` (text, nullable)   # stable dedupe key / future merge key
+- `preferred_source_id` (uuid, nullable, fk → track_sources.id)
+- `duration_sec` (numeric)
+- `codec` (text)
+- `bitrate` (int)
+- `sample_rate` (int)
+- `channels` (int)
+- `playability_status` (text: ok|flaky|bad)
+- `playability_fail_count` (int)
+- `playability_last_error` (text)
+- `favorite` (bool, default false)
+- `hidden` (bool, default false)
+- `created_at` (timestamptz)
+- `updated_at` (timestamptz)
+
+### track_sources
+Represents one observed file instance discovered by an agent.
+
+- `id` (uuid, pk)
+- `track_id` (uuid, fk → tracks.id)
 - `user_id` (uuid, fk → users.id)
 - `agent_id` (uuid, fk → agents.id)
 - `rel_path` (text)               # normalized relative path
@@ -45,13 +66,16 @@ Represents a unique file instance discovered by an agent.
 - `bitrate` (int)
 - `sample_rate` (int)
 - `channels` (int)
+- `source_rank` (int)             # preferred file quality / source order
+- `is_available` (bool)
+- `last_seen_at` (timestamptz)
 - `created_at` (timestamptz)
 - `updated_at` (timestamptz)
 
-### tags
-Raw embedded tags extracted from files.
+### source_tags
+Raw embedded tags extracted from file instances.
 
-- `track_id` (uuid, fk → tracks.id, pk)
+- `track_source_id` (uuid, fk → track_sources.id, pk)
 - `title` (text)
 - `artist` (text)
 - `album` (text)
@@ -74,7 +98,7 @@ Raw embedded tags extracted from files.
 - `year` (text)
 
 ### tracks_norm
-Normalized references for search/browse (derived from tags).
+Normalized references for search/browse (derived from canonical track metadata).
 
 - `track_id` (uuid, pk, fk → tracks.id)
 - `artist_id` (uuid, fk → artists.id)
@@ -133,8 +157,10 @@ Server-side audio analysis results.
 
 ## Indexes (initial)
 
-- `tracks (user_id, rel_path)`
-- `tracks (user_id, mtime)`
+- `tracks (user_id, hidden, favorite)`
+- `track_sources (user_id, agent_id, rel_path)`
+- `track_sources (user_id, mtime)`
+- `track_sources (track_id, is_available, source_rank)`
 - `tracks_norm (artist_id)`
 - `tracks_norm (album_id)`
 - `stations (user_id)`
@@ -154,6 +180,14 @@ Enforce at:
 ## Next Steps
 
 1. Implement migrations.
-2. Add server scan ingest to write tracks + tags.
-3. Add normalization job to populate artists/albums/tracks_norm.
-4. Add server-side analysis worker to populate `track_analysis`.
+2. Add server scan ingest to write `track_sources` + `source_tags`.
+3. Add canonicalization job to choose/create `tracks` from source instances.
+4. Add normalization job to populate artists/albums/tracks_norm.
+5. Add server-side analysis worker to populate `track_analysis`.
+
+## Transition Notes
+
+1. Existing MySQL `tracks.canonical_json` can act as a temporary canonical-track cache during rollout.
+2. JSON per-user libraries are fallback/cache only; DB should become the system of record.
+3. Multi-user onboarding requires all dedupe keys and source-instance rows to be scoped by `user_id`.
+4. A single song may have multiple file instances for one user; do not model path/mtime as the logical track identity.

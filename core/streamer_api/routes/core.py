@@ -3,6 +3,7 @@ import json, time, requests
 import os, subprocess, re
 import hashlib
 import uuid
+import random
 from difflib import SequenceMatcher
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse, RedirectResponse, Response
@@ -15,6 +16,9 @@ from ..models import (
     MetadataEnrichPayload,
     MetadataEnrichLibraryPayload,
     MetadataResetPayload,
+    MetadataAlbumResetPayload,
+    MobileNextPayload,
+    TrackHealthScanPayload,
 )
 from ..storage import (
     load_lib,
@@ -26,6 +30,10 @@ from ..storage import (
     load_metadata_library,
     save_metadata_library,
     db_upsert_tracks,
+    db_upsert_track_sources,
+    db_mark_all_track_sources_unavailable,
+    db_upsert_track_health,
+    db_list_track_health,
     db_insert_provider_snapshot,
     db_upsert_override,
     db_find_metadata_seed,
@@ -52,6 +60,9 @@ LEGACY_AUDIO_EXTS = {
 }
 
 PLAYABILITY_BAD_THRESHOLD = max(1, int(os.getenv("RT_PLAYABILITY_BAD_THRESHOLD", "3") or "3"))
+TRACK_HEALTH_FFPROBE_TIMEOUT_SEC = max(5, int(os.getenv("RT_TRACK_HEALTH_FFPROBE_TIMEOUT_SEC", "20") or "20"))
+TRACK_HEALTH_DECODE_SEC = max(0, int(os.getenv("RT_TRACK_HEALTH_DECODE_SEC", "8") or "8"))
+TRACK_HEALTH_DECODE_TIMEOUT_SEC = max(5, int(os.getenv("RT_TRACK_HEALTH_DECODE_TIMEOUT_SEC", "30") or "30"))
 
 
 def _track_needs_mp3_proxy(track: Dict[str, Any]) -> bool:
@@ -343,6 +354,136 @@ def _probe_duration_sec(url: str) -> Optional[float]:
         return val if val > 0 else None
     except Exception:
         return None
+
+
+def _ffprobe_media(url: str) -> Dict[str, Any]:
+    try:
+        cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-show_entries", "format=duration:stream=codec_name,codec_type",
+            "-of", "json",
+            url,
+        ]
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=TRACK_HEALTH_FFPROBE_TIMEOUT_SEC,
+            check=False,
+            text=True,
+        )
+        stderr = (proc.stderr or "").strip()
+        if proc.returncode != 0:
+            return {"ok": False, "returncode": proc.returncode, "stderr": stderr}
+        data = {}
+        try:
+            data = json.loads(proc.stdout or "{}")
+        except Exception:
+            data = {}
+        codec = None
+        for stream in data.get("streams") or []:
+            if str(stream.get("codec_type") or "") == "audio":
+                codec = stream.get("codec_name")
+                break
+        duration = None
+        try:
+            duration = float(((data.get("format") or {}).get("duration")) or 0.0)
+        except Exception:
+            duration = None
+        return {"ok": True, "duration_sec": duration, "codec": codec, "raw": data}
+    except Exception as e:
+        return {"ok": False, "stderr": str(e)}
+
+
+def _ffmpeg_decode_probe(url: str, decode_sec: int) -> Dict[str, Any]:
+    if decode_sec <= 0:
+        return {"ok": True, "skipped": True}
+    try:
+        cmd = [
+            "ffmpeg",
+            "-nostdin",
+            "-v", "error",
+            "-xerror",
+            "-t", str(int(decode_sec)),
+            "-i", url,
+            "-map", "0:a:0",
+            "-f", "null",
+            "-",
+        ]
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=TRACK_HEALTH_DECODE_TIMEOUT_SEC,
+            check=False,
+            text=True,
+        )
+        stderr = (proc.stderr or "").strip()
+        return {"ok": proc.returncode == 0, "returncode": proc.returncode, "stderr": stderr}
+    except Exception as e:
+        return {"ok": False, "stderr": str(e)}
+
+
+def _track_health_entry(user_id: str, track: Dict[str, Any]) -> Dict[str, Any]:
+    source_path = track.get("source_path") or track.get("rel_path") or track.get("path")
+    url = build_stream_url(user_id, track)
+    details: Dict[str, Any] = {"url": url, "source_path": source_path}
+    entry: Dict[str, Any] = {
+        "track_uid": str(track.get("track_id") or ""),
+        "source_path": source_path,
+        "status": "warning",
+        "source_reachable": False,
+        "probe_ok": False,
+        "decode_ok": False,
+        "duration_sec": None,
+        "codec": track.get("codec"),
+        "error_reason": "unknown",
+        "details": details,
+    }
+    if not url:
+        entry["error_reason"] = "no-base-url-or-rel-path"
+        return entry
+    try:
+        head = requests.head(url, timeout=(5, 15), allow_redirects=True, headers={"User-Agent": "RadioTiker-Health/0.1"})
+        details["head_status"] = int(head.status_code)
+        if head.status_code >= 400:
+            entry["error_reason"] = f"source-unreachable:http-{head.status_code}"
+            return entry
+        entry["source_reachable"] = True
+    except requests.RequestException as e:
+        entry["error_reason"] = f"source-unreachable:{e}"
+        return entry
+
+    probe = _ffprobe_media(url)
+    details["probe"] = {k: v for k, v in probe.items() if k != "raw"}
+    if not probe.get("ok"):
+        entry["status"] = "error"
+        entry["error_reason"] = f"ffprobe-failed:{probe.get('stderr') or 'unknown'}"
+        return entry
+
+    entry["probe_ok"] = True
+    if probe.get("duration_sec") is not None:
+        entry["duration_sec"] = probe.get("duration_sec")
+    if probe.get("codec"):
+        entry["codec"] = probe.get("codec")
+
+    if not entry.get("duration_sec") or float(entry.get("duration_sec") or 0.0) <= 0.0:
+        entry["status"] = "error"
+        entry["error_reason"] = "invalid-duration"
+        return entry
+
+    decode = _ffmpeg_decode_probe(url, TRACK_HEALTH_DECODE_SEC)
+    details["decode"] = decode
+    if not decode.get("ok"):
+        entry["status"] = "error"
+        entry["error_reason"] = f"decode-failed:{decode.get('stderr') or 'unknown'}"
+        return entry
+
+    entry["decode_ok"] = True
+    entry["status"] = "ok"
+    entry["error_reason"] = ""
+    return entry
 
 def _ffmpeg_cmd_for_http_input(url: str, abr_kbps: int = 192, start_sec: float = 0.0) -> list[str]:
     # 192 kbps CBR is a sweet spot for mobile/Bluetooth reliability.
@@ -653,11 +794,88 @@ def health():
 @router.post("/library/{user_id}/clear")
 def clear_library(user_id: str):
     lib = load_lib(user_id)
+    track_ids = list((lib.get("tracks") or {}).keys())
     lib["tracks"] = {}
     lib["version"] = int(time.time())
     lib["_cleared_for"] = 0
     save_lib(user_id, lib)
+    if track_ids:
+        db_delete_tracks(user_id, track_ids, purge_related=True)
     return {"ok": True, "cleared": True, "version": lib["version"]}
+
+
+@router.get("/library/{user_id}/health")
+def get_library_health(user_id: str, status: Optional[str] = None, limit: int = 100):
+    rows = db_list_track_health(user_id, status=status, limit=limit)
+    lib = load_lib(user_id)
+    out = []
+    for row in rows:
+        tid = str(row.get("track_uid") or "")
+        track = (lib.get("tracks") or {}).get(tid) or {}
+        item = dict(row)
+        item["track_id"] = tid
+        item["title"] = track.get("title")
+        item["artist"] = track.get("artist")
+        item["album"] = track.get("album")
+        raw = item.get("details_json")
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                raw = raw.decode("utf-8")
+            except Exception:
+                raw = None
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = None
+        item["details"] = raw or {}
+        item.pop("details_json", None)
+        out.append(item)
+    return {"ok": True, "user_id": user_id, "count": len(out), "items": out}
+
+
+@router.post("/library/{user_id}/health-check")
+def scan_library_health(user_id: str, payload: TrackHealthScanPayload):
+    lib = load_lib(user_id)
+    tracks = list((lib.get("tracks") or {}).values())
+    by_id = {str(t.get("track_id") or ""): t for t in tracks if t.get("track_id")}
+    requested = [str(tid) for tid in (payload.track_ids or []) if str(tid or "").strip()]
+    if requested:
+        candidates = [by_id[tid] for tid in requested if tid in by_id]
+    else:
+        candidates = sorted(
+            tracks,
+            key=lambda t: (
+                str(t.get("playability_status") or "") != "bad",
+                int(t.get("playability_fail_count") or 0),
+                str(t.get("title") or ""),
+            ),
+            reverse=False,
+        )
+    limit = max(1, min(int(payload.limit or 25), 250))
+    checked = []
+    persisted = []
+    for track in candidates[:limit]:
+        entry = _track_health_entry(user_id, track)
+        persisted.append(entry)
+        if payload.include_ok or entry.get("status") != "ok":
+            checked.append(
+                {
+                    "track_id": str(track.get("track_id") or ""),
+                    "title": track.get("title"),
+                    "artist": track.get("artist"),
+                    "album": track.get("album"),
+                    **entry,
+                }
+            )
+    db_upsert_track_health(user_id, persisted)
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "scanned": len(persisted),
+        "returned": len(checked),
+        "items": checked,
+    }
 
 
 @router.post("/library/{user_id}/reset-enrichment")
@@ -719,6 +937,43 @@ def reset_library_enrichment(user_id: str, payload: MetadataResetPayload):
         "track_ids": target_ids,
         "version": lib["version"],
     }
+
+
+@router.post("/library/{user_id}/reset-enrichment-album")
+def reset_library_enrichment_album(user_id: str, payload: MetadataAlbumResetPayload):
+    """
+    Reset enriched metadata for all tracks matching a given album,
+    optionally constrained by artist. This stays valid even when the UI
+    does not group tracks by album.
+    """
+    lib = load_lib(user_id)
+    tracks = lib.get("tracks", {})
+    album_key = normalize_text_key(payload.album)
+    artist_key = normalize_text_key(payload.artist) if str(payload.artist or "").strip() else ""
+    if not album_key:
+        raise HTTPException(status_code=400, detail="Album is required")
+
+    target_ids = []
+    for tid, t in tracks.items():
+        t_album = normalize_text_key(t.get("album"))
+        t_artist = normalize_text_key(t.get("artist"))
+        if t_album != album_key:
+            continue
+        if artist_key and t_artist != artist_key:
+            continue
+        target_ids.append(str(tid))
+
+    if not target_ids:
+        return {"ok": True, "changed": 0, "track_ids": [], "version": lib.get("version")}
+
+    return reset_library_enrichment(
+        user_id,
+        MetadataResetPayload(
+            track_ids=target_ids,
+            clear_overrides=bool(payload.clear_overrides),
+            clear_provider_snapshots=bool(payload.clear_provider_snapshots),
+        ),
+    )
 
 
 @router.post("/library/{user_id}/track/{track_id}/auto-enrich")
@@ -1067,75 +1322,25 @@ def get_library(user_id: str):
 @router.get("/mobile/bootstrap/{user_id}")
 def get_mobile_bootstrap(user_id: str):
     """
-    Mobile-first payload for Expo/React Native clients.
-    Returns compact catalog + stream path hints without UI-specific shape.
+    Tiny/mobile bootstrap.
+    Returns only the minimum catalog needed to choose a track without
+    shipping full metadata for the entire library.
     """
     lib = load_lib(user_id)
     tracks = []
-    albums: Dict[str, Dict[str, Any]] = {}
     mobile_force_mp3 = str(os.getenv("RT_MOBILE_FORCE_MP3", "1")).strip().lower() not in {"0", "false", "off", "no"}
     for t in lib["tracks"].values():
         tid = str(t.get("track_id") or "")
         if not tid:
             continue
-        artist = str(t.get("artist") or "Unknown Artist")
-        album = str(t.get("album") or "Unknown Album")
-        title = str(t.get("title") or "Unknown Title")
-        album_key = f"{artist}::{album}".lower()
-        art_urls = t.get("artwork_urls") or []
-        artist_urls = t.get("artist_image_urls") or []
-        artwork_url = str(
-            t.get("artwork_url")
-            or (art_urls[0] if art_urls else "")
-            or ""
-        )
-        artist_image_url = str((artist_urls[0] if artist_urls else "") or "")
-        force_mp3 = _track_needs_mp3_proxy(t)
-        stream_path_mobile = f"/streamer/api/relay-mp3/{user_id}/{tid}" if mobile_force_mp3 else (
-            f"/streamer/api/{'relay-mp3' if force_mp3 else 'relay'}/{user_id}/{tid}"
-        )
-        row = {
+        tracks.append({
             "track_id": tid,
-            "title": title,
-            "artist": artist,
-            "album": album,
-            "genre": str(t.get("genre") or ""),
-            "year": t.get("year"),
-            "duration_sec": float(t.get("duration_sec") or 0),
-            "track_no": t.get("track_no"),
-            "disc_no": t.get("disc_no"),
-            "codec": str(t.get("codec") or ""),
-            "format_family": str(t.get("format_family") or ""),
-            "metadata_source": str(t.get("metadata_source") or ""),
-            "metadata_source_score": t.get("metadata_source_score"),
-            "metadata_quality": int(t.get("metadata_quality") or 0),
-            "artwork_url": artwork_url,
-            "artist_image_url": artist_image_url,
-            "artist_bio": str(t.get("artist_bio") or ""),
-            "album_bio": str(t.get("album_bio") or ""),
-            "needs_transcode": bool(force_mp3),
-            "stream_path": f"/streamer/api/{'relay-mp3' if force_mp3 else 'relay'}/{user_id}/{tid}",
-            "stream_path_mobile": stream_path_mobile,
-            "stream_path_mp3": f"/streamer/api/relay-mp3/{user_id}/{tid}",
-            "stream_path_native": f"/streamer/api/relay/{user_id}/{tid}",
-        }
-        tracks.append(row)
-        bucket = albums.setdefault(
-            album_key,
-            {
-                "album_key": album_key,
-                "album": album,
-                "artist": artist,
-                "year": t.get("year"),
-                "genre": str(t.get("genre") or ""),
-                "artwork_url": artwork_url,
-                "track_ids": [],
-            },
-        )
-        bucket["track_ids"].append(tid)
+            "playability_status": str(t.get("playability_status") or ""),
+            "playability_fail_count": int(t.get("playability_fail_count") or 0),
+            "playability_last_error": str(t.get("playability_last_error") or ""),
+        })
 
-    tracks.sort(key=lambda x: (x["artist"].lower(), x["album"].lower(), x["disc_no"] or 0, x["track_no"] or 0, x["title"].lower()))
-    album_list = sorted(albums.values(), key=lambda x: (str(x["artist"]).lower(), str(x["album"]).lower()))
+    tracks.sort(key=lambda x: x["track_id"])
     return {
         "ok": True,
         "user_id": user_id,
@@ -1144,8 +1349,83 @@ def get_mobile_bootstrap(user_id: str):
         "mobile_force_mp3": bool(mobile_force_mp3),
         "generated_at": int(time.time()),
         "tracks": tracks,
-        "albums": album_list,
     }
+
+
+@router.get("/mobile/track/{user_id}/{track_id}")
+def get_mobile_track_detail(user_id: str, track_id: str):
+    lib = load_lib(user_id)
+    t = (lib.get("tracks") or {}).get(track_id)
+    if not t:
+        raise HTTPException(status_code=404, detail="Unknown track_id")
+    art_urls = t.get("artwork_urls") or []
+    artist_urls = t.get("artist_image_urls") or []
+    force_mp3 = _track_needs_mp3_proxy(t)
+    mobile_force_mp3 = str(os.getenv("RT_MOBILE_FORCE_MP3", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    stream_path_mobile = f"/streamer/api/relay-mp3/{user_id}/{track_id}" if mobile_force_mp3 else (
+        f"/streamer/api/{'relay-mp3' if force_mp3 else 'relay'}/{user_id}/{track_id}"
+    )
+    return {
+        "ok": True,
+        "track_id": track_id,
+        "title": str(t.get("title") or "Unknown Title"),
+        "artist": str(t.get("artist") or "Unknown Artist"),
+        "album": str(t.get("album") or ""),
+        "genre": str(t.get("genre") or ""),
+        "year": t.get("year"),
+        "duration_sec": float(t.get("duration_sec") or 0),
+        "needs_transcode": bool(force_mp3),
+        "stream_path_mobile": stream_path_mobile,
+        "stream_path_mp3": f"/streamer/api/relay-mp3/{user_id}/{track_id}",
+        "stream_path_native": f"/streamer/api/relay/{user_id}/{track_id}",
+        "metadata_source": str(t.get("metadata_source") or ""),
+        "metadata_source_score": t.get("metadata_source_score"),
+        "artwork_url": str(t.get("artwork_url") or (art_urls[0] if art_urls else "") or ""),
+        "artwork_urls": art_urls,
+        "artist_image_url": str((artist_urls[0] if artist_urls else "") or ""),
+        "artist_image_urls": artist_urls,
+        "artist_bio": str(t.get("artist_bio") or ""),
+        "album_bio": str(t.get("album_bio") or ""),
+        "playability_status": str(t.get("playability_status") or ""),
+        "playability_fail_count": int(t.get("playability_fail_count") or 0),
+        "playability_last_error": str(t.get("playability_last_error") or ""),
+    }
+
+
+@router.post("/mobile/next/{user_id}")
+def get_mobile_next_track(user_id: str, payload: MobileNextPayload):
+    lib = load_lib(user_id)
+    tracks = list((lib.get("tracks") or {}).values())
+    if not tracks:
+        return {"ok": True, "track": None, "reason": "empty-library"}
+
+    recent = {str(tid or "").strip() for tid in (payload.recent_track_ids or []) if str(tid or "").strip()}
+    current_tid = str(payload.current_track_id or "").strip()
+    if current_tid:
+        recent.add(current_tid)
+
+    playable = []
+    fallback = []
+    for t in tracks:
+        tid = str(t.get("track_id") or "")
+        if not tid:
+            continue
+        status = str(t.get("playability_status") or "").strip().lower()
+        fail_count = int(t.get("playability_fail_count") or 0)
+        if status == "bad" or fail_count >= PLAYABILITY_BAD_THRESHOLD:
+            continue
+        fallback.append(tid)
+        if tid not in recent:
+            playable.append(tid)
+
+    chosen = None
+    if playable:
+        chosen = random.choice(playable)
+    elif fallback:
+        chosen = random.choice(fallback)
+    if not chosen:
+        return {"ok": True, "track": None, "reason": "no-playable-tracks"}
+    return {"ok": True, "track": get_mobile_track_detail(user_id, chosen)}
 
 
 @router.get("/library/{user_id}/metadata-summary")
@@ -1359,11 +1639,16 @@ def submit_scan(payload: ScanPayload):
     """
     lib = load_lib(payload.user_id)
     tracks = lib["tracks"]
+    batch_size = len(payload.library or [])
+    bulk_scan_payload = batch_size > 1
+    ingest_write_only = str(os.getenv("RT_SCAN_INGEST_WRITE_ONLY", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    skip_hot_path_enrich = ingest_write_only and bulk_scan_payload
 
     session_ver = int(payload.library_version or int(time.time()))
     if payload.replace and lib.get("_cleared_for") != session_ver:
         tracks.clear()
         lib["_cleared_for"] = session_ver
+        db_mark_all_track_sources_unavailable(payload.user_id)
 
     db_rows = []
     auto_enrich_candidates: list[str] = []
@@ -1373,7 +1658,8 @@ def submit_scan(payload: ScanPayload):
         auto_cooldown_sec = 43200
     auto_cooldown_sec = max(300, min(auto_cooldown_sec, 86400 * 7))
     now_ts = int(time.time())
-    seed_enabled = str(os.getenv("RT_DB_SEED_ENABLED", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    seed_config_enabled = str(os.getenv("RT_DB_SEED_ENABLED", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    seed_enabled = seed_config_enabled and not skip_hot_path_enrich
     for t in payload.library:
         d = t.model_dump()
         # Persist scanner-origin core fields so bad enrichments can be rolled back later.
@@ -1435,9 +1721,12 @@ def submit_scan(payload: ScanPayload):
     lib["version"] = session_ver
     save_lib(payload.user_id, lib)
     db_upsert_tracks(payload.user_id, db_rows)
+    db_upsert_track_sources(payload.user_id, db_rows)
 
-    # Optional incremental enrichment on scan so player gets images/bios without manual backfill.
-    auto_enrich_enabled = str(os.getenv("RT_AUTO_ENRICH_ON_SCAN", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    # Keep bulk ingest write-only by default. Enrichment should run after scan completion,
+    # not inside the submit-scan request path where it causes timeouts and retry churn.
+    auto_enrich_config_enabled = str(os.getenv("RT_AUTO_ENRICH_ON_SCAN", "1")).strip().lower() not in {"0", "false", "off", "no"}
+    auto_enrich_enabled = auto_enrich_config_enabled and not skip_hot_path_enrich
     auto_scanned = 0
     auto_matched = 0
     auto_applied = 0
@@ -1555,6 +1844,8 @@ def submit_scan(payload: ScanPayload):
         "agent_base_url": st.get("base_url"),
         "auto_enrich": {
             "enabled": auto_enrich_enabled,
+            "config_enabled": auto_enrich_config_enabled,
+            "write_only_skipped": skip_hot_path_enrich,
             "scanned": auto_scanned,
             "matched": auto_matched,
             "applied": auto_applied,
@@ -1571,7 +1862,9 @@ def submit_scan(payload: ScanPayload):
                 "applied": auto_stage2_applied,
             },
             "seed_enabled": seed_enabled,
+            "seed_config_enabled": seed_config_enabled,
         },
+        "ingest_mode": "write-only" if skip_hot_path_enrich else "inline-enrich",
         "preview": preview
     }
 

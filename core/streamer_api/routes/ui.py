@@ -77,16 +77,15 @@ def player(user_id: str):
   .danger{{background:#b91c1c;color:#fff;border:none}}
   .dot{{width:10px;height:10px;border-radius:50%;display:inline-block;vertical-align:middle;margin-right:6px;background:#bbb}}
   .dot.ok{{background:#16a34a}}
-  .album-card{{border:1px solid #e5e7eb;border-radius:10px;margin-top:12px;overflow:visible}}
-  .album-head{{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:10px 12px;background:#fafafa;border-bottom:1px solid #eee}}
-  .album-main{{display:flex;gap:10px;align-items:center;min-width:0}}
-  .album-cover{{width:52px;height:52px;border-radius:6px;object-fit:cover;border:1px solid #ddd;background:#f3f4f6;flex:0 0 52px}}
-  .album-title{{font-weight:600}}
-  .album-meta{{font-size:13px;color:#666}}
-  .album-actions{{display:flex;align-items:center;gap:8px;flex-wrap:wrap}}
-  .album-tracks{{padding:8px 10px}}
-  .track-row{{display:grid;grid-template-columns:1fr 170px 72px 140px 70px 250px;gap:8px;align-items:center;padding:6px 4px;border-bottom:1px solid #f1f1f1}}
+  .track-table{{border:1px solid #e5e7eb;border-radius:10px;overflow:hidden;margin-top:10px}}
+  .track-head,.track-row{{display:grid;grid-template-columns:34px 1.5fr 1fr 1.2fr 120px 140px 70px 52px;gap:8px;align-items:center}}
+  .track-head{{position:sticky;top:0;z-index:2;background:#f8fafc;border-bottom:1px solid #e5e7eb;padding:8px 10px}}
+  .track-row{{padding:6px 10px;border-bottom:1px solid #f1f1f1}}
   .track-row:last-child{{border-bottom:none}}
+  .col-sort{{background:none;border:none;color:#111;font-weight:600;cursor:pointer;padding:0}}
+  .col-sort:hover{{text-decoration:underline}}
+  .fav-btn{{border:none;background:transparent;cursor:pointer;font-size:16px;line-height:1;color:#9ca3af;padding:0 2px}}
+  .fav-btn.on{{color:#f59e0b}}
   .track-title{{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
   .track-artist{{font-size:13px;color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
   .muted{{color:#777;font-size:13px}}
@@ -119,8 +118,8 @@ def player(user_id: str):
   .menu-item:hover{{background:#f3f4f6}}
   .hidden-panel{{margin-top:10px;padding:10px;border:1px solid #ececec;border-radius:8px;background:#fcfcfc}}
   @media (max-width: 760px) {{
-    .track-row{{grid-template-columns:1fr 60px 128px 66px 150px}}
-    .track-artist{{display:none}}
+    .track-head,.track-row{{grid-template-columns:30px 1.4fr 95px 118px 60px 44px}}
+    .track-artist,.track-album{{display:none}}
     .filter-grid{{grid-template-columns:1fr 1fr}}
     .now-meta-main{{grid-template-columns:1fr}}
     .now-meta-hero-wrap{{justify-content:flex-start}}
@@ -139,6 +138,14 @@ def player(user_id: str):
     <button class="btn" onclick="playNext()">⏭️ Next</button>
     <label class="pill"><input type="checkbox" id="autoplay" checked> Autoplay</label>
     <label class="pill"><input type="checkbox" id="shuffle"> Shuffle</label>
+    <label class="pill" title="Shuffle behavior">
+      Mode:
+      <select id="shuffleMode" style="margin-left:6px;padding:3px 6px;border:1px solid #d5d5d5;border-radius:6px">
+        <option value="balanced">Balanced</option>
+        <option value="discovery">Discovery</option>
+        <option value="favorites">Favorites</option>
+      </select>
+    </label>
     <button class="btn danger" onclick="confirmClear()">Clear library</button>
     <button class="btn" onclick="resetCurrentTrackMetadata()">Reset current metadata</button>
     <button class="btn" onclick="resetAllEnrichedMetadata()">Reset all enriched metadata</button>
@@ -160,7 +167,7 @@ def player(user_id: str):
   </div>
   <div style="margin-top:6px">
     <b>Now Playing:</b> <span id="now">—</span>
-    · <button id="nowAlbumBtn" class="link-btn" type="button" onclick="goToNowPlayingAlbum()" disabled>Go to album</button>
+    · <button id="nowAlbumBtn" class="link-btn" type="button" onclick="goToNowPlayingAlbum()" disabled>Go to track</button>
   </div>
   <div class="now-meta" id="nowMetaPanel">
     <div class="now-meta-main">
@@ -188,12 +195,7 @@ def player(user_id: str):
 
 <main>
   <p>User: <b>{user_id}</b> · Library version: <b>{lib['version']}</b></p>
-  <div class="row">
-    <b>Albums:</b>
-    <button class="btn" type="button" onclick="setAllAlbums(true)">Select All</button>
-    <button class="btn" type="button" onclick="setAllAlbums(false)">Unselect All</button>
-    <span class="muted">Shuffle uses only selected albums.</span>
-  </div>
+  <div class="row"><b>Tracks</b></div>
   <section class="filters">
     <div class="filter-grid">
       <input id="fltQuery" type="text" placeholder="Search title, artist, album, genre">
@@ -236,6 +238,7 @@ def player(user_id: str):
 
 function libver() {{ return Math.floor(Date.now()/1000); }}
 const userId = "{user_id}";
+const LIBRARY_VERSION = "{lib['version']}";
 const API = (window.location.pathname.startsWith("/streamer/")) ? "/streamer/api" : "/api";
 const TRACKS = {tracks_json};
 const TRACK_BY_ID = Object.fromEntries(TRACKS.map(t => [t.track_id, t]));
@@ -244,6 +247,12 @@ const ALBUM_OPEN_KEY = "rt-album-open-" + userId;
 const TRACK_STATE_KEY = "rt-track-enabled-" + userId;
 const FILTER_STATE_KEY = "rt-library-filter-" + userId;
 const KEEP_AWAKE_KEY = "rt-keep-awake-" + userId;
+const SHUFFLE_STATE_KEY = "rt-shuffle-state-" + userId + "-" + LIBRARY_VERSION;
+const FAVORITES_KEY = "rt-favorites-" + userId;
+const PLAY_COUNTS_KEY = "rt-play-counts-" + userId + "-" + LIBRARY_VERSION;
+const SHUFFLE_BAG_KEY = "rt-shuffle-bag-" + userId + "-" + LIBRARY_VERSION;
+const SHUFFLE_MODE_KEY = "rt-shuffle-mode-" + userId;
+const SORT_STATE_KEY = "rt-track-sort-" + userId;
 const MOBILE_UA = /iPhone|iPad|iPod|Android|Mobile/i.test(navigator.userAgent || "");
 const CROSSFADE_ENABLED = !MOBILE_UA && !!(window.AudioContext || window.webkitAudioContext);
 let currentTid = null;
@@ -266,6 +275,42 @@ let prefetchInFlight = new Set();
 let durationProbeInFlight = new Map();
 let unknownDurationRecoveryTid = null;
 const SHUFFLE_RECENT_WINDOW = 12;
+const SHUFFLE_ARTIST_COOLDOWN = 3;
+const SHUFFLE_ALBUM_COOLDOWN = 2;
+const FAVORITE_WEIGHT_BALANCED = 1.6;
+const FAVORITE_WEIGHT_FAVORITES = 2.2;
+
+function savePlaybackState() {{
+  try {{
+    const payload = {{
+      play_history: Array.isArray(playHistory) ? playHistory.slice(-500) : [],
+      history_index: Number.isFinite(historyIndex) ? historyIndex : -1,
+      current_tid: currentTid || null,
+      last_tid: lastTid || null,
+      ts: Date.now()
+    }};
+    localStorage.setItem(SHUFFLE_STATE_KEY, JSON.stringify(payload));
+  }} catch (e) {{}}
+}}
+
+function loadPlaybackState() {{
+  try {{
+    const raw = localStorage.getItem(SHUFFLE_STATE_KEY);
+    if (!raw) return;
+    const j = JSON.parse(raw);
+    if (!j || !Array.isArray(j.play_history)) return;
+    const valid = j.play_history.filter(tid => !!TRACK_BY_ID[tid]);
+    playHistory = valid.slice(-500);
+    const idx = Number(j.history_index);
+    historyIndex = (Number.isFinite(idx) && idx >= 0 && idx < playHistory.length) ? idx : (playHistory.length - 1);
+    const cur = String(j.current_tid || "");
+    const lst = String(j.last_tid || "");
+    if (cur && TRACK_BY_ID[cur]) currentTid = cur;
+    if (lst && TRACK_BY_ID[lst]) lastTid = lst;
+  }} catch (e) {{}}
+}}
+loadPlaybackState();
+
 function canPrefetch() {{
   if (MOBILE_UA) return false;
   const c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
@@ -577,9 +622,82 @@ function loadTrackEnabled() {{
 function saveTrackEnabled() {{
   localStorage.setItem(TRACK_STATE_KEY, JSON.stringify(trackEnabled));
 }}
+function loadFavorites() {{
+  try {{
+    const raw = localStorage.getItem(FAVORITES_KEY);
+    const state = raw ? JSON.parse(raw) : {{}};
+    if (!state || typeof state !== "object") return {{}};
+    return state;
+  }} catch {{
+    return {{}};
+  }}
+}}
+function saveFavorites() {{
+  try {{
+    localStorage.setItem(FAVORITES_KEY, JSON.stringify(favorites));
+  }} catch {{}}
+}}
+function loadPlayCounts() {{
+  try {{
+    const raw = localStorage.getItem(PLAY_COUNTS_KEY);
+    const state = raw ? JSON.parse(raw) : {{}};
+    if (!state || typeof state !== "object") return {{}};
+    return state;
+  }} catch {{
+    return {{}};
+  }}
+}}
+function savePlayCounts() {{
+  try {{
+    localStorage.setItem(PLAY_COUNTS_KEY, JSON.stringify(playCounts));
+  }} catch {{}}
+}}
+function loadShuffleBag() {{
+  try {{
+    const raw = localStorage.getItem(SHUFFLE_BAG_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(arr)) return [];
+    return arr.filter(tid => !!TRACK_BY_ID[tid]);
+  }} catch {{
+    return [];
+  }}
+}}
+function saveShuffleBag() {{
+  try {{
+    localStorage.setItem(SHUFFLE_BAG_KEY, JSON.stringify(shuffleBag.slice(-50000)));
+  }} catch {{}}
+}}
+function loadShuffleMode() {{
+  const v = String(localStorage.getItem(SHUFFLE_MODE_KEY) || "balanced");
+  if (v === "balanced" || v === "discovery" || v === "favorites") return v;
+  return "balanced";
+}}
+function saveShuffleMode(v) {{
+  const mode = (v === "discovery" || v === "favorites") ? v : "balanced";
+  localStorage.setItem(SHUFFLE_MODE_KEY, mode);
+}}
+function loadSortState() {{
+  try {{
+    const raw = localStorage.getItem(SORT_STATE_KEY);
+    const j = raw ? JSON.parse(raw) : null;
+    const field = String(j?.field || "title");
+    const dir = String(j?.dir || "asc") === "desc" ? "desc" : "asc";
+    return {{ field, dir }};
+  }} catch {{
+    return {{ field: "title", dir: "asc" }};
+  }}
+}}
+function saveSortState() {{
+  localStorage.setItem(SORT_STATE_KEY, JSON.stringify(sortState));
+}}
 let albumEnabled = loadAlbumEnabled();
 let albumOpen = loadAlbumOpen();
 let trackEnabled = loadTrackEnabled();
+let favorites = loadFavorites();
+let playCounts = loadPlayCounts();
+let shuffleBag = loadShuffleBag();
+let shuffleMode = loadShuffleMode();
+let sortState = loadSortState();
 
 async function confirmClear() {{
   if (!window.confirm("Are you sure you want to CLEAR your library on the server?")) return;
@@ -677,20 +795,26 @@ async function rejectTrackMatch(trackId) {{
 window.rejectTrackMatch = rejectTrackMatch;
 
 async function rejectAlbumMatch(albumKey) {{
+  const sample = TRACKS.find(t => albumKeyOf(t.album || "Unknown Album") === albumKey);
+  if (!sample) {{
+    showStatus("No tracks found for that album.", "warn", 3000);
+    return;
+  }}
   const tids = TRACKS
     .filter(t => albumKeyOf(t.album || "Unknown Album") === albumKey)
     .map(t => t.track_id)
     .filter(Boolean);
-  if (!tids.length) {{
-    showStatus("No tracks found for that album.", "warn", 3000);
-    return;
-  }}
   if (!window.confirm("Reset enriched metadata for this entire album (" + tids.length + " tracks)?")) return;
   try {{
-    const res = await fetch(API + "/library/" + userId + "/reset-enrichment", {{
+    const res = await fetch(API + "/library/" + userId + "/reset-enrichment-album", {{
       method: "POST",
       headers: {{ "Content-Type": "application/json" }},
-      body: JSON.stringify({{ track_ids: tids }})
+      body: JSON.stringify({{
+        album: sample.album || "Unknown Album",
+        artist: sample.artist || "",
+        clear_overrides: true,
+        clear_provider_snapshots: true
+      }})
     }});
     if (!res.ok) throw new Error(await res.text());
     const j = await res.json();
@@ -812,69 +936,107 @@ function renderAlbumList() {{
   const root = document.getElementById("albumList");
   if (!root) return;
   const albums = filteredAlbums();
-  if (albums.length === 0) {{
+  const tracks = albums.flatMap(a => a.tracks);
+  if (tracks.length === 0) {{
     root.innerHTML = "<p class=\\"muted\\">No matching albums/tracks for current filters.</p>";
     updateLibrarySummary(albums);
     renderHiddenTracks();
     return;
   }}
-  root.innerHTML = albums.map(a => {{
-    const open = albumOpen[a.key];
-    const enabled = albumEnabled[a.key];
-    const tracksHtml = a.tracks.map(t => {{
-      const src = sourceLabel(t);
-      const locked = !!t.auto_enrich_disabled;
-      const lockLabel = locked ? "Auto-enrich off" : "Never auto-enrich";
-      const qScore = trackQualityScore(t);
-      const qLabel = trackQualityLabel(t);
-      const qDetail = trackQualityDetail(t);
-      const healthBad = !isTrackPlayable(t);
-      const healthLabel = healthBad ? " · Unplayable" : "";
-      const dur = formatDuration(t.duration_sec);
-      return (
-        "<div class=\\"track-row\\">" +
-          "<div class=\\"track-title\\" title=\\"" + escapeHtml(t.title) + "\\">" + escapeHtml(t.title) + "</div>" +
-          "<div class=\\"track-artist\\" title=\\"" + escapeHtml(t.artist) + "\\">" + escapeHtml(t.artist) + (src ? " · " + escapeHtml(src) : "") + "</div>" +
-          "<div class=\\"muted\\" title=\\"" + escapeHtml("Q" + qScore + " · " + qLabel + " · " + qDetail + healthLabel) + "\\">" + dur + " · Q" + qScore + " " + escapeHtml(qLabel) + (healthBad ? " · ⚠" : "") + "</div>" +
-          "<label class=\\"pill\\"><input type=\\"checkbox\\" " + (trackEnabled[t.track_id] ? "checked" : "") + " onchange=\\"toggleTrackEnabled('" + t.track_id + "', this.checked)\\"> In Shuffle</label>" +
-          "<div><button class=\\"btn\\" type=\\"button\\" onclick=\\"playById('" + t.track_id + "')\\">Play</button></div>" +
-          "<div style=\\"display:flex;justify-content:flex-end\\">" +
-            "<div class=\\"menu-wrap\\">" +
-              "<button class=\\"btn\\" type=\\"button\\" onclick=\\"toggleTrackMenu('" + t.track_id + "', event)\\">⋯</button>" +
-              "<div class=\\"menu-panel\\" id=\\"" + trackMenuId(t.track_id) + "\\">" +
-                "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"findBetterMatch('" + t.track_id + "'); closeTrackMenus();\\">Find next match</button>" +
-                "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"rejectTrackMatch('" + t.track_id + "'); closeTrackMenus();\\">Reject match</button>" +
-                "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"toggleNeverAutoEnrich('" + t.track_id + "', " + (locked ? "true" : "false") + "); closeTrackMenus();\\">" + lockLabel + "</button>" +
-                "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"hideTrack('" + t.track_id + "'); closeTrackMenus();\\">Hide track</button>" +
-                "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"removeTrack('" + t.track_id + "'); closeTrackMenus();\\">Remove track</button>" +
-              "</div>" +
-            "</div>" +
-          "</div>" +
-        "</div>"
-      );
-    }}).join("");
+  const sortDir = sortState.dir === "desc" ? "↓" : "↑";
+  const sortMark = (f) => (sortState.field === f ? (" " + sortDir) : "");
+  const sorted = sortTracks(tracks);
+  const rows = sorted.map(t => {{
+    const src = sourceLabel(t);
+    const locked = !!t.auto_enrich_disabled;
+    const lockLabel = locked ? "Auto-enrich off" : "Never auto-enrich";
+    const isFav = !!favorites[t.track_id];
+    const favMenuLabel = isFav ? "Unfavorite" : "Favorite";
+    const qScore = trackQualityScore(t);
+    const qLabel = trackQualityLabel(t);
+    const qDetail = trackQualityDetail(t);
+    const healthBad = !isTrackPlayable(t);
+    const healthLabel = healthBad ? " · Unplayable" : "";
+    const dur = formatDuration(t.duration_sec);
     return (
-      "<section id=\\"" + albumDomId(a.key) + "\\" class=\\"album-card\\">" +
-        "<div class=\\"album-head\\">" +
-          "<div class=\\"album-main\\">" +
-            "<img class=\\"album-cover\\" src=\\"" + escapeHtml(a.artwork_url || "") + "\\" alt=\\"Album cover\\" loading=\\"lazy\\" onerror=\\"this.style.display='none'\\">" +
-            "<div>" +
-              "<div class=\\"album-title\\">" + escapeHtml(a.name) + "</div>" +
-              "<div class=\\"album-meta\\">" + escapeHtml(a.artist) + " · " + a.tracks.length + " tracks</div>" +
+      "<div class=\\"track-row\\" id=\\"track-" + t.track_id + "\\">" +
+        "<div><button class=\\"fav-btn " + (isFav ? "on" : "") + "\\" type=\\"button\\" title=\\"" + (isFav ? "Unfavorite" : "Favorite") + "\\" onclick=\\"toggleFavoriteTrack('" + t.track_id + "')\\">★</button></div>" +
+        "<div class=\\"track-title\\" title=\\"" + escapeHtml(t.title) + "\\">" + escapeHtml(t.title) + "</div>" +
+        "<div class=\\"track-artist\\" title=\\"" + escapeHtml(t.artist) + "\\">" + escapeHtml(t.artist) + (src ? " · " + escapeHtml(src) : "") + "</div>" +
+        "<div class=\\"track-album\\" title=\\"" + escapeHtml(t.album || "Unknown Album") + "\\">" + escapeHtml(t.album || "Unknown Album") + "</div>" +
+        "<div class=\\"muted\\" title=\\"" + escapeHtml("Q" + qScore + " · " + qLabel + " · " + qDetail + healthLabel) + "\\">" + dur + " · Q" + qScore + " " + escapeHtml(qLabel) + (healthBad ? " · ⚠" : "") + "</div>" +
+        "<label class=\\"pill\\"><input type=\\"checkbox\\" " + (trackEnabled[t.track_id] ? "checked" : "") + " onchange=\\"toggleTrackEnabled('" + t.track_id + "', this.checked)\\"> In Shuffle</label>" +
+        "<div><button class=\\"btn\\" type=\\"button\\" onclick=\\"playById('" + t.track_id + "')\\">Play</button></div>" +
+        "<div style=\\"display:flex;justify-content:flex-end\\">" +
+          "<div class=\\"menu-wrap\\">" +
+            "<button class=\\"btn\\" type=\\"button\\" onclick=\\"toggleTrackMenu('" + t.track_id + "', event)\\">⋯</button>" +
+            "<div class=\\"menu-panel\\" id=\\"" + trackMenuId(t.track_id) + "\\">" +
+              "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"findBetterMatch('" + t.track_id + "'); closeTrackMenus();\\">Find next match</button>" +
+              "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"rejectTrackMatch('" + t.track_id + "'); closeTrackMenus();\\">Reject match</button>" +
+              "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"toggleFavoriteTrack('" + t.track_id + "'); closeTrackMenus();\\">" + favMenuLabel + "</button>" +
+              "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"toggleNeverAutoEnrich('" + t.track_id + "', " + (locked ? "true" : "false") + "); closeTrackMenus();\\">" + lockLabel + "</button>" +
+              "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"hideTrack('" + t.track_id + "'); closeTrackMenus();\\">Hide track</button>" +
+              "<button class=\\"menu-item\\" type=\\"button\\" onclick=\\"removeTrack('" + t.track_id + "'); closeTrackMenus();\\">Remove track</button>" +
             "</div>" +
-          "</div>" +
-          "<div class=\\"album-actions\\">" +
-            "<label class=\\"pill\\"><input type=\\"checkbox\\" " + (enabled ? "checked" : "") + " onchange=\\"toggleAlbumEnabled('" + a.key + "', this.checked)\\"> In Shuffle</label>" +
-            "<button class=\\"btn\\" type=\\"button\\" onclick=\\"rejectAlbumMatch('" + a.key + "')\\">Reject album metadata</button>" +
-            "<button class=\\"btn\\" type=\\"button\\" onclick=\\"toggleAlbumOpen('" + a.key + "')\\">" + (open ? "Hide" : "Open") + "</button>" +
           "</div>" +
         "</div>" +
-        "<div class=\\"album-tracks\\" style=\\"display:" + (open ? "block" : "none") + "\\">" + tracksHtml + "</div>" +
-      "</section>"
+      "</div>"
     );
   }}).join("");
+  root.innerHTML =
+    "<section class=\\"track-table\\">" +
+      "<div class=\\"track-head\\">" +
+        "<button class=\\"col-sort\\" type=\\"button\\" title=\\"Sort by favorite\\" onclick=\\"toggleSort('favorite')\\">★" + sortMark("favorite") + "</button>" +
+        "<button class=\\"col-sort\\" type=\\"button\\" onclick=\\"toggleSort('title')\\">Title" + sortMark("title") + "</button>" +
+        "<button class=\\"col-sort\\" type=\\"button\\" onclick=\\"toggleSort('artist')\\">Artist" + sortMark("artist") + "</button>" +
+        "<button class=\\"col-sort\\" type=\\"button\\" onclick=\\"toggleSort('album')\\">Album" + sortMark("album") + "</button>" +
+        "<button class=\\"col-sort\\" type=\\"button\\" onclick=\\"toggleSort('quality')\\">Quality" + sortMark("quality") + "</button>" +
+        "<span class=\\"muted\\">Shuffle</span>" +
+        "<span class=\\"muted\\">Play</span>" +
+        "<span class=\\"muted\\">⋯</span>" +
+      "</div>" +
+      rows +
+    "</section>";
   updateLibrarySummary(albums);
   renderHiddenTracks();
+}}
+
+function toggleSort(field) {{
+  const f = String(field || "title");
+  if (sortState.field === f) sortState.dir = (sortState.dir === "asc" ? "desc" : "asc");
+  else {{
+    sortState.field = f;
+    sortState.dir = (f === "favorite") ? "desc" : "asc";
+  }}
+  saveSortState();
+  renderAlbumList();
+}}
+window.toggleSort = toggleSort;
+
+function sortTracks(tracks) {{
+  const dir = (sortState.dir === "desc") ? -1 : 1;
+  const field = String(sortState.field || "title");
+  const a = (tracks || []).slice();
+  const num = (v) => Number(v || 0);
+  a.sort((x, y) => {{
+    let cmp = 0;
+    if (field === "favorite") {{
+      cmp = (favorites[y.track_id] ? 1 : 0) - (favorites[x.track_id] ? 1 : 0);
+    }} else if (field === "quality") {{
+      cmp = num(trackQualityScore(x)) - num(trackQualityScore(y));
+    }} else if (field === "duration") {{
+      cmp = num(x.duration_sec) - num(y.duration_sec);
+    }} else if (field === "artist") {{
+      cmp = String(x.artist || "").localeCompare(String(y.artist || ""));
+    }} else if (field === "album") {{
+      cmp = String(x.album || "").localeCompare(String(y.album || ""));
+    }} else {{
+      cmp = String(x.title || "").localeCompare(String(y.title || ""));
+    }}
+    if (cmp === 0) cmp = String(x.title || "").localeCompare(String(y.title || ""));
+    return cmp * dir;
+  }});
+  return a;
 }}
 
 function _trackMatchesFilters(t) {{
@@ -1181,6 +1343,17 @@ function toggleTrackEnabled(tid, enabled) {{
 }}
 window.toggleTrackEnabled = toggleTrackEnabled;
 
+function toggleFavoriteTrack(tid) {{
+  const key = String(tid || "");
+  if (!key) return;
+  if (favorites[key]) delete favorites[key];
+  else favorites[key] = true;
+  saveFavorites();
+  renderAlbumList();
+  showStatus(favorites[key] ? "Favorited." : "Unfavorited.", "info", 1800);
+}}
+window.toggleFavoriteTrack = toggleFavoriteTrack;
+
 function toggleAlbumOpen(key) {{
   const next = !albumOpen[key];
   for (const a of ALBUMS) albumOpen[a.key] = false;
@@ -1203,38 +1376,37 @@ function metaFor(tid) {{
   return t;
 }}
 
-function updateNowAlbumLink(albumName) {{
+function updateNowAlbumLink(trackId) {{
   const btn = document.getElementById("nowAlbumBtn");
   if (!btn) return;
-  const key = albumKeyOf(albumName);
-  const known = ALBUMS.some(a => a.key === key);
+  const tid = String(trackId || "");
+  const known = !!TRACK_BY_ID[tid];
   if (!known) {{
     btn.disabled = true;
-    btn.textContent = "Go to album";
-    btn.dataset.albumKey = "";
+    btn.textContent = "Go to track";
+    btn.dataset.trackId = "";
     return;
   }}
   btn.disabled = false;
-  btn.textContent = "Go to album";
-  btn.dataset.albumKey = key;
+  btn.textContent = "Go to track";
+  btn.dataset.trackId = tid;
 }}
 
 function goToNowPlayingAlbum() {{
   const btn = document.getElementById("nowAlbumBtn");
-  const key = btn && btn.dataset ? btn.dataset.albumKey : "";
-  if (!key) return;
-  if (!albumOpen[key]) {{
-    albumOpen[key] = true;
-    saveAlbumOpen();
-    renderAlbumList();
-  }}
-  const el = document.getElementById(albumDomId(key));
-  if (!el) {{
-    resetFilters();
-  }}
-  const el2 = document.getElementById(albumDomId(key));
-  if (!el2) return;
-  el2.scrollIntoView({{ behavior: "smooth", block: "start" }});
+  const tid = btn && btn.dataset ? btn.dataset.trackId : "";
+  if (!tid) return;
+  const row = document.getElementById("track-" + tid);
+  if (!row) return;
+  const topPanel = document.querySelector(".playerbar");
+  const metaPanel = document.getElementById("nowMetaPanel");
+  const topH = topPanel ? topPanel.getBoundingClientRect().height : 0;
+  const metaH = metaPanel ? metaPanel.getBoundingClientRect().height : 0;
+  const extra = Math.max(16, Math.min(64, metaH * 0.08));
+  const y = window.scrollY + row.getBoundingClientRect().top - topH - extra;
+  window.scrollTo({{ top: Math.max(0, y), behavior: "smooth" }});
+  row.style.outline = "2px solid #93c5fd";
+  setTimeout(() => {{ row.style.outline = ""; }}, 1200);
 }}
 window.goToNowPlayingAlbum = goToNowPlayingAlbum;
 
@@ -1242,6 +1414,15 @@ document.addEventListener('DOMContentLoaded', () => {{
   bindFilterUi();
   renderAlbumList();
   refreshPlaylists();
+  const sm = document.getElementById("shuffleMode");
+  if (sm) {{
+    sm.value = shuffleMode;
+    sm.addEventListener("change", () => {{
+      shuffleMode = String(sm.value || "balanced");
+      saveShuffleMode(shuffleMode);
+      showStatus("Shuffle mode: " + shuffleMode, "info", 1600);
+    }});
+  }}
   document.addEventListener("click", () => closeTrackMenus());
 }});
 
@@ -1359,7 +1540,7 @@ function setNowPlaying(tid) {{
   }}
   document.getElementById('now').innerText = m.artist + " — " + m.title + albumText + durText;
   renderNowMeta(m);
-  updateNowAlbumLink(m.album);
+  updateNowAlbumLink(tid);
   refreshSeekUi();
 }}
 
@@ -1435,29 +1616,122 @@ function orderedTracks() {{
 
 function shuffleEligibleTracks() {{
   return TRACKS.filter(
-    t => !t.is_hidden && isTrackPlayable(t) && albumEnabled[albumKeyOf(t.album)] && !!trackEnabled[t.track_id]
+    t => !t.is_hidden && isTrackPlayable(t) && !!trackEnabled[t.track_id]
   );
 }}
 
+function trackArtistKey(t) {{
+  return _normText(t && t.artist);
+}}
+function trackAlbumKey(t) {{
+  return _normText(t && t.album);
+}}
+function shuffleFavoriteWeight() {{
+  if (shuffleMode === "favorites") return FAVORITE_WEIGHT_FAVORITES;
+  if (shuffleMode === "discovery") return 1.0;
+  return FAVORITE_WEIGHT_BALANCED;
+}}
+function trackShuffleWeight(t) {{
+  const tid = t && t.track_id;
+  if (!tid) return 1.0;
+  const plays = Math.max(0, Number(playCounts[tid] || 0));
+  const novelty = 1 / Math.sqrt(plays + 1); // 1.0 new -> decays smoothly
+  const noveltyWeight = 0.65 + (1.35 * novelty);
+  const favWeight = favorites[tid] ? shuffleFavoriteWeight() : 1.0;
+  return Math.max(0.0001, noveltyWeight * favWeight);
+}}
+function pickWeightedTrackId(candidates) {{
+  if (!candidates || candidates.length === 0) return null;
+  let total = 0;
+  const weighted = candidates.map(t => {{
+    const w = trackShuffleWeight(t);
+    total += w;
+    return {{ t, w }};
+  }});
+  if (!(total > 0)) return candidates[Math.floor(Math.random() * candidates.length)].track_id;
+  let r = Math.random() * total;
+  for (const it of weighted) {{
+    r -= it.w;
+    if (r <= 0) return it.t.track_id;
+  }}
+  return weighted[weighted.length - 1].t.track_id;
+}}
+function ensureShuffleBag(list) {{
+  const activeIds = new Set((list || []).map(t => t.track_id));
+  shuffleBag = shuffleBag.filter(tid => activeIds.has(tid));
+  if (shuffleBag.length === 0) {{
+    shuffleBag = (list || []).map(t => t.track_id);
+    // Fisher-Yates
+    for (let i = shuffleBag.length - 1; i > 0; i--) {{
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = shuffleBag[i];
+      shuffleBag[i] = shuffleBag[j];
+      shuffleBag[j] = tmp;
+    }}
+  }}
+  saveShuffleBag();
+}}
 function pickShuffleTrackIdNoRecent(list) {{
   if (!list || list.length === 0) return null;
   if (list.length === 1) return list[0].track_id;
-  const ids = list.map(t => t.track_id);
-  const windowSize = Math.max(1, Math.min(SHUFFLE_RECENT_WINDOW, Math.floor(ids.length * 0.5)));
-  const blocked = new Set();
-  if (currentTid) blocked.add(currentTid);
-  for (let i = playHistory.length - 1; i >= 0 && blocked.size < windowSize + 1; i--) {{
+
+  ensureShuffleBag(list);
+  const idSet = new Set(list.map(t => t.track_id));
+  const byId = Object.fromEntries(list.map(t => [t.track_id, t]));
+  const windowSize = Math.max(1, Math.min(SHUFFLE_RECENT_WINDOW, Math.floor(list.length * 0.5)));
+  const blockedTracks = new Set();
+  const blockedArtists = new Set();
+  const blockedAlbums = new Set();
+  if (currentTid) blockedTracks.add(currentTid);
+
+  let artistSlots = SHUFFLE_ARTIST_COOLDOWN;
+  let albumSlots = SHUFFLE_ALBUM_COOLDOWN;
+  for (let i = playHistory.length - 1; i >= 0 && blockedTracks.size < (windowSize + 1); i--) {{
     const tid = playHistory[i];
-    if (!tid) continue;
-    if (!ids.includes(tid)) continue;
-    blocked.add(tid);
+    if (!tid || !idSet.has(tid)) continue;
+    const tr = byId[tid];
+    blockedTracks.add(tid);
+    if (tr && artistSlots > 0) {{
+      const ak = trackArtistKey(tr);
+      if (ak) blockedArtists.add(ak);
+      artistSlots -= 1;
+    }}
+    if (tr && albumSlots > 0) {{
+      const bk = trackAlbumKey(tr);
+      if (bk) blockedAlbums.add(bk);
+      albumSlots -= 1;
+    }}
   }}
-  let candidates = list.filter(t => !blocked.has(t.track_id));
-  if (candidates.length === 0) {{
-    candidates = list.filter(t => t.track_id !== currentTid);
+
+  const bagSet = new Set(shuffleBag);
+  const pickFrom = (sourceList, relaxArtist, relaxAlbum, relaxTrackWindow) => sourceList.filter(t => {{
+    if (!t) return false;
+    if (!relaxTrackWindow && blockedTracks.has(t.track_id)) return false;
+    if (!relaxArtist) {{
+      const ak = trackArtistKey(t);
+      if (ak && blockedArtists.has(ak)) return false;
+    }}
+    if (!relaxAlbum) {{
+      const bk = trackAlbumKey(t);
+      if (bk && blockedAlbums.has(bk)) return false;
+    }}
+    return true;
+  }});
+
+  const bagTracks = list.filter(t => bagSet.has(t.track_id));
+  let candidates = pickFrom(bagTracks, false, false, false);
+  if (!candidates.length) candidates = pickFrom(bagTracks, false, true, false);
+  if (!candidates.length) candidates = pickFrom(bagTracks, true, true, false);
+  if (!candidates.length) candidates = pickFrom(list, false, false, false);
+  if (!candidates.length) candidates = pickFrom(list, false, true, true);
+  if (!candidates.length) candidates = list.slice();
+
+  const chosen = pickWeightedTrackId(candidates);
+  if (chosen) {{
+    shuffleBag = shuffleBag.filter(tid => tid !== chosen);
+    saveShuffleBag();
   }}
-  if (candidates.length === 0) candidates = list.slice();
-  return candidates[Math.floor(Math.random() * candidates.length)].track_id;
+  return chosen;
 }}
 
 function currentPlaybackSec() {{
@@ -1468,6 +1742,17 @@ function currentPlaybackSec() {{
 function noteProgress() {{
   lastProgressWallMs = Date.now();
   lastProgressPlaybackSec = currentPlaybackSec();
+}}
+function noteTrackPlay(tid) {{
+  const key = String(tid || "");
+  if (!key) return;
+  const n = Math.max(0, Number(playCounts[key] || 0)) + 1;
+  playCounts[key] = n;
+  if (shuffleBag.includes(key)) {{
+    shuffleBag = shuffleBag.filter(x => x !== key);
+    saveShuffleBag();
+  }}
+  savePlayCounts();
 }}
 
 function effectiveTrackDurationSec() {{
@@ -1574,14 +1859,18 @@ async function playIdAt(tid, startSec, opts = {{}}) {{
     }} catch {{}}
   }}
   if (!started) {{
+    let reason = "";
+    try {{
+      reason = await classifyPlaybackError(a1.currentSrc || urlFor(tid, true, currentStartOffsetSec));
+    }} catch {{}}
     showStatus(
       triedMp3Fallback
-        ? "Audio failed on native and MP3 relay for this track."
-        : "Audio failed to start for this track.",
+        ? ("Audio failed on native and MP3 relay for this track." + (reason ? (" Reason: " + reason) : ""))
+        : ("Audio failed to start for this track." + (reason ? (" Reason: " + reason) : "")),
       "error",
-      6000
+      8000
     );
-    return;
+    return false;
   }}
   await ensureWakeLock();
   try {{ a2.pause(); }} catch {{}}
@@ -1596,9 +1885,12 @@ async function playIdAt(tid, startSec, opts = {{}}) {{
       }}
       playHistory.push(tid);
       historyIndex = playHistory.length - 1;
+      noteTrackPlay(tid);
     }}
   }}
   noteProgress();
+  savePlaybackState();
+  return true;
 }}
 window.playById = (tid) => {{
   // Explicit row "Play" must always honor the selected track.
@@ -1651,9 +1943,11 @@ async function xfadeTo(tid, opts = {{}}) {{
       }}
       playHistory.push(tid);
       historyIndex = playHistory.length - 1;
+      noteTrackPlay(tid);
     }}
   }}
   noteProgress();
+  savePlaybackState();
 
   // 3) After fade, HANDOFF to a1 so the UI bar controls the real audio.
   setTimeout(async () => {{
@@ -1733,7 +2027,7 @@ function prefetchUpcomingTrack() {{
   const nextTid = peekNextTrackIdForPrefetch();
   prefetchTrackIfNeeded(nextTid);
 }}
-function playNext() {{
+async function playNext() {{
   const shuffleOn = !!(document.getElementById('shuffle') && document.getElementById('shuffle').checked);
   let tid = null;
   let fromHistory = false;
@@ -1741,6 +2035,7 @@ function playNext() {{
     historyIndex += 1;
     tid = playHistory[historyIndex];
     fromHistory = true;
+    savePlaybackState();
   }} else {{
     tid = pickNextTrackId();
   }}
@@ -1749,7 +2044,11 @@ function playNext() {{
     return;
   }}
   const useX = CROSSFADE_ENABLED && document.getElementById('xfade') && document.getElementById('xfade').checked;
-  useX ? xfadeTo(tid, {{ recordHistory: !fromHistory }}) : playIdAt(tid, 0, {{ recordHistory: !fromHistory }});
+  if (useX) {{
+    await xfadeTo(tid, {{ recordHistory: !fromHistory }});
+  }} else {{
+    await playIdAt(tid, 0, {{ recordHistory: !fromHistory }});
+  }}
 }}
 function playPrev() {{
   let tid = null;
@@ -1758,6 +2057,7 @@ function playPrev() {{
     historyIndex -= 1;
     tid = playHistory[historyIndex];
     fromHistory = true;
+    savePlaybackState();
   }} else {{
     tid = pickPrevTrackId();
   }}
@@ -1965,9 +2265,8 @@ renderAlbumList();
 # ---------------- UI: tiny radio page ----------------
 @router.get("/user/{user_id}/play-mobile")
 def play_mobile(user_id: str, request: Request):
-    # Dedicated mobile entrypoint; serve hardened player directly to avoid
-    # redirect/caching quirks on mobile browsers.
-    return player(user_id)
+    # Dedicated mobile entrypoint: always serve stripped tiny player.
+    return radio_page(user_id, request)
 
 
 @router.get("/radio/{user_id}", response_class=HTMLResponse)
@@ -1976,28 +2275,12 @@ def radio_page(user_id: str, request: Request):
     # Redirect only mobile UA to hardened mobile player; keep desktop /radio unchanged.
     ua = str(request.headers.get("user-agent") or "").lower()
     is_mobile = any(tok in ua for tok in ("iphone", "ipad", "ipod", "android", "mobile"))
+    path = str(request.url.path or "")
+    is_mobile_entry = path.endswith(f"/user/{user_id}/play-mobile")
     force_tiny = str(request.query_params.get("tiny") or "").strip().lower() in {"1", "true", "yes", "on"}
-    if is_mobile and not force_tiny:
-        path = str(request.url.path or "")
+    if is_mobile and not force_tiny and not is_mobile_entry:
         base = "/streamer/api" if path.startswith("/streamer/") else "/api"
         return RedirectResponse(url=f"{base}/user/{user_id}/play-mobile", status_code=307)
-
-    lib = load_lib(user_id)
-    tracks = []
-    for t in lib["tracks"].values():
-        tracks.append({
-            "track_id": t.get("track_id"),
-            "title": t.get("title") or "Unknown Title",
-            "artist": t.get("artist") or "Unknown Artist",
-            "album":  t.get("album")  or "",
-            "artwork_url": t.get("artwork_url") or ((t.get("artwork_urls") or [""])[0] or ""),
-            "artist_image_url": ((t.get("artist_image_urls") or [""])[0] or ""),
-            "artist_bio": t.get("artist_bio") or "",
-            "album_bio": t.get("album_bio") or "",
-            "duration_sec": t.get("duration_sec") or 0,
-            "force_mp3": _track_needs_mp3_proxy(t),
-        })
-    tracks_json = json.dumps(tracks)
 
     html = f"""<!doctype html>
 <html>
@@ -2050,7 +2333,7 @@ def radio_page(user_id: str, request: Request):
 
 function libver() {{ return Math.floor(Date.now()/1000); }}
 const userId = "{user_id}";
-const TRACKS = {tracks_json};
+let TRACKS = [];
 
 // Robust API base: if path contains /streamer/ anywhere, use /streamer/api
 const API = "/streamer/api";
@@ -2069,6 +2352,31 @@ function tinyCanPrefetch() {{
 let statusTimer = null;
 let prefetchedTinyTrackIds = new Set();
 let tinyPrefetchInFlight = new Set();
+let tinyTracksLoadPromise = null;
+let tinyTrackDetailInFlight = new Map();
+
+async function loadTinyTracks() {{
+  if (tinyTracksLoadPromise) return tinyTracksLoadPromise;
+  tinyTracksLoadPromise = (async () => {{
+    const res = await fetch(API + "/mobile/bootstrap/" + encodeURIComponent(userId) + "?v=" + libver(), {{ cache: "no-store" }});
+    if (!res.ok) throw new Error("Bootstrap HTTP " + res.status);
+    const j = await res.json();
+    const incoming = Array.isArray(j?.tracks) ? j.tracks : [];
+    TRACKS = incoming.map(t => {{
+      return {{
+        track_id: t?.track_id || "",
+        playability_status: t?.playability_status || "",
+        playability_fail_count: Number(t?.playability_fail_count || 0),
+        playability_last_error: t?.playability_last_error || "",
+      }};
+    }}).filter(t => !!t.track_id);
+    return TRACKS.length;
+  }})().catch(err => {{
+    tinyTracksLoadPromise = null;
+    throw err;
+  }});
+  return tinyTracksLoadPromise;
+}}
 function showStatus(message, level = "info", timeoutMs = 4500) {{
   const el = document.getElementById("statusBanner");
   if (!el) return;
@@ -2081,6 +2389,23 @@ function showStatus(message, level = "info", timeoutMs = 4500) {{
       el.textContent = "";
       statusTimer = null;
     }}, timeoutMs);
+  }}
+}}
+
+async function loadTinyTrackDetail(trackId) {{
+  const tid = String(trackId || "").trim();
+  if (!tid) return null;
+  if (tinyTrackDetailInFlight.has(tid)) return tinyTrackDetailInFlight.get(tid);
+  const p = (async () => {{
+    const res = await fetch(API + "/mobile/track/" + encodeURIComponent(userId) + "/" + encodeURIComponent(tid) + "?v=" + libver(), {{ cache: "no-store" }});
+    if (!res.ok) throw new Error("Track detail HTTP " + res.status);
+    return await res.json();
+  }})();
+  tinyTrackDetailInFlight.set(tid, p);
+  try {{
+    return await p;
+  }} finally {{
+    tinyTrackDetailInFlight.delete(tid);
   }}
 }}
 
@@ -2129,7 +2454,36 @@ function pickIndex() {{
   return candidates[Math.floor(Math.random() * candidates.length)];
 }}
 
+function tinyPlayabilitySummary() {{
+  if (!Array.isArray(TRACKS) || TRACKS.length === 0) return "";
+  const bad = TRACKS.filter(t => String(t?.playability_status || "").toLowerCase() === "bad");
+  if (!bad.length) return "";
+  const sample = bad.find(t => String(t?.playability_last_error || "").trim()) || bad[0];
+  const reason = String(sample?.playability_last_error || "").trim();
+  return bad.length + " tracks are currently marked bad" + (reason ? (". Sample reason: " + reason) : ".");
+}}
+
+async function fetchTinyNextTrack(opts = {{}}) {{
+  const res = await fetch(API + "/mobile/next/" + encodeURIComponent(userId), {{
+    method: "POST",
+    headers: {{ "Content-Type": "application/json" }},
+    body: JSON.stringify({{
+      current_track_id: String(opts.currentTrackId || ""),
+      recent_track_ids: Array.isArray(opts.recentTrackIds) ? opts.recentTrackIds : [],
+    }}),
+    cache: "no-store",
+  }});
+  if (!res.ok) throw new Error("Next track HTTP " + res.status);
+  const j = await res.json();
+  return j?.track || null;
+}}
+
 function urlFor(track) {{
+  const mobilePath = String(track?.stream_path_mobile || "");
+  if (mobilePath) {{
+    const sep = mobilePath.includes("?") ? "&" : "?";
+    return mobilePath + sep + "v=" + libver();
+  }}
   const base = track && track.force_mp3 ? "/relay-mp3/" : "/relay/";
   return API + base + userId + "/" + track.track_id + "?v=" + libver();
 }}
@@ -2152,8 +2506,11 @@ function setAudioSrc(audio, url) {{
   audio.src = url;
 }}
 
-function playIndex(i, opts = {{}}) {{
-  const m = TRACKS[i]; if (!m) return;
+async function playIndex(i, opts = {{}}) {{
+  const baseTrack = TRACKS[i]; if (!baseTrack) return;
+  const detail = await loadTinyTrackDetail(baseTrack.track_id);
+  const m = Object.assign({{}}, baseTrack, detail || {{}});
+  TRACKS[i] = m;
   const recordHistory = opts.recordHistory !== false;
   current = i;
   if (m.track_id) {{
@@ -2187,24 +2544,38 @@ function playIndex(i, opts = {{}}) {{
   document.getElementById('now').innerText = m.artist + " — " + m.title + albumText + durText;
   const nowImg = document.getElementById("nowImg");
   const nowMeta = document.getElementById("nowMeta");
-  if (nowMeta) {{
-    const bits = [];
-    if (m.artist) bits.push(m.artist);
-    if (m.album) bits.push(m.album);
-    nowMeta.textContent = bits.join(" · ");
-  }}
+  if (nowMeta) nowMeta.textContent = [m.artist, m.album].filter(Boolean).join(" · ");
   if (nowImg) {{
-    const src = String(m.artwork_url || m.artist_image_url || "").trim();
-    if (src) {{
-      nowImg.src = src;
-      nowImg.style.display = "";
-      nowImg.onerror = () => {{
-        nowImg.style.display = "none";
-      }};
-    }} else {{
-      nowImg.style.display = "none";
-      nowImg.removeAttribute("src");
+    nowImg.style.display = "none";
+    nowImg.removeAttribute("src");
+  }}
+  try {{
+    const detail = await loadTinyTrackDetail(m.track_id);
+    if (detail && nowMeta) {{
+      const bits = [];
+      if (detail.artist) bits.push(detail.artist);
+      if (detail.album) bits.push(detail.album);
+      if (detail.year) bits.push(String(detail.year));
+      if (detail.genre) bits.push(String(detail.genre));
+      nowMeta.textContent = bits.join(" · ");
+      const artistBio = String(detail.artist_bio || "").trim();
+      const albumBio = String(detail.album_bio || "").trim();
+      if (artistBio || albumBio) {{
+        nowMeta.textContent += (nowMeta.textContent ? "\\n\\n" : "") + [artistBio, albumBio].filter(Boolean).join("\\n\\n");
+      }}
     }}
+    if (detail && nowImg) {{
+      const src = String(detail.artwork_url || detail.artist_image_url || "").trim();
+      if (src) {{
+        nowImg.src = src;
+        nowImg.style.display = "";
+        nowImg.onerror = () => {{
+          nowImg.style.display = "none";
+        }};
+      }}
+    }}
+  }} catch (e) {{
+    console.warn("[tiny] track detail fetch failed", e);
   }}
   // Warm a candidate next track while current is playing to reduce gap.
   setTimeout(() => {{
@@ -2228,8 +2599,25 @@ function playNext() {{
     const i = indexOfTrackId(tid);
     if (i >= 0) {{ playIndex(i, {{ recordHistory: false }}); return; }}
   }}
-  const i = pickIndex();
-  if (i >= 0) playIndex(i, {{ recordHistory: true }});
+  fetchTinyNextTrack({{
+    currentTrackId: (current >= 0 && TRACKS[current]) ? TRACKS[current].track_id : "",
+    recentTrackIds: tinyRecentTrackIds.slice(-TINY_SHUFFLE_RECENT_WINDOW),
+  }}).then(track => {{
+    if (!track || !track.track_id) {{
+      showStatus(tinyPlayabilitySummary() || "No playable tracks are currently available.", "warn", 5000);
+      return;
+    }}
+    const i = indexOfTrackId(track.track_id);
+    if (i >= 0) {{
+      TRACKS[i] = Object.assign({{}}, TRACKS[i], track);
+      playIndex(i, {{ recordHistory: true }});
+      return;
+    }}
+    TRACKS.push(track);
+    playIndex(TRACKS.length - 1, {{ recordHistory: true }});
+  }}).catch(err => {{
+    showStatus("Could not fetch next track: " + (err?.message || "unknown error"), "error", 5000);
+  }});
 }}
 function playPrev() {{
   if (tinyHistoryIndex > 0) {{
@@ -2350,8 +2738,16 @@ async function refreshStatus() {{
     document.getElementById('stDot').classList.remove('ok');
   }}
 }}
-refreshStatus();
-setInterval(refreshStatus, 10000);
+(async () => {{
+  try {{
+    const n = await loadTinyTracks();
+    if (!n) showStatus("Library is empty.", "warn", 5000);
+  }} catch (e) {{
+    showStatus("Could not load track list: " + (e?.message || "unknown error"), "error", 7000);
+  }}
+  refreshStatus();
+  setInterval(refreshStatus, 10000);
+}})();
 </script>
 </body>
 </html>"""

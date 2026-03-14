@@ -7,6 +7,7 @@ import re
 import shutil
 import json
 import subprocess
+import threading
 import requests
 from mutagen import File
 from dotenv import load_dotenv
@@ -49,6 +50,7 @@ POST_SCAN_ENRICH_PROVIDERS = [
     for p in os.getenv("RT_POST_SCAN_ENRICH_PROVIDERS", "musicbrainz,discogs,acoustid").split(",")
     if p.strip()
 ]
+HEARTBEAT_INTERVAL_SEC = max(15, int(os.getenv("RT_AGENT_HEARTBEAT_INTERVAL_SEC", "60") or "60"))
 
 
 def _scan_resume_file(user_id: str):
@@ -214,6 +216,22 @@ def announce_agent(user_id: str, base_url: str):
         print("📣 Announce:", r.status_code, r.text[:200])
     except Exception as e:
         print("❌ Announce failed:", e)
+
+
+def start_heartbeat_loop(user_id: str, base_url: str):
+    stop_event = threading.Event()
+
+    def _beat():
+        while not stop_event.is_set():
+            try:
+                requests.post(ANNOUNCE_URL, json={"user_id": user_id, "base_url": base_url}, timeout=5)
+            except Exception:
+                pass
+            stop_event.wait(HEARTBEAT_INTERVAL_SEC)
+
+    t = threading.Thread(target=_beat, daemon=True)
+    t.start()
+    return stop_event
 
 
 def run_post_scan_enrichment(user_id: str):
@@ -561,6 +579,7 @@ if __name__ == "__main__":
     base = server.base_url()
     print(f"🔌 Local server: {base}")
     announce_agent(USER_ID, base)
+    heartbeat_stop = start_heartbeat_loop(USER_ID, base)
 
     def run_full_scan_cycle(reason: str = "scheduled"):
         print(f"🔎 Full scan ({reason}) started")
@@ -586,5 +605,7 @@ if __name__ == "__main__":
                     run_full_scan_cycle("interval")
                     last_scan_ts = now
     except KeyboardInterrupt:
+        if heartbeat_stop:
+            heartbeat_stop.set()
         if tunnel:
             tunnel.stop()

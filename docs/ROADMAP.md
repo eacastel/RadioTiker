@@ -85,15 +85,17 @@ Goal: move from JSON-file libraries to durable relational ingest pipeline.
 
 Deliverables:
 1. Implement migrations from `docs/DB_SCHEMA.md` baseline:
-   - `users`, `agents`, `tracks`, `tags`, `scans`
-2. Write scan ingest path into DB while preserving compatibility playback.
+   - `users`, `agents`, `tracks`, `track_sources`, `source_tags`, `scans`
+2. Write scan ingest path into DB as file-instance observations while preserving compatibility playback.
 3. Add scan history and ingest metrics per user/agent.
 4. Keep current JSON fallback during rollout (feature-flagged).
+5. Pilot DB-backed library reads per user.
 
 Exit criteria:
 1. New scans persist to DB successfully.
 2. Playback reads from DB-backed track records for pilot users.
-3. Rollback path exists and is tested.
+3. Source instances survive rescans/restarts without recreating logical track state.
+4. Rollback path exists and is tested.
 
 ## M4 - Track Normalization + Metadata (Requested Focus Shift)
 
@@ -163,3 +165,25 @@ Sprint B:
 1. Implement DB migrations and initial ingest write path (M3).
 2. Run pilot with one user and validate rollback.
 3. Define exact normalization rules for M4 and lock acceptance tests.
+
+## DB-First Transition Notes
+
+For multi-user onboarding, the relational DB must become the system of record.
+
+Rules:
+1. Per-user JSON libraries are fallback/cache only during transition.
+2. New DB-backed read paths must be feature-flagged for rollout.
+3. Deletion/reset paths must clear DB state, not just JSON cache.
+4. Track identity must evolve toward canonical track + file-instance separation.
+
+Current transition flag:
+1. `RT_DB_CANONICAL_READS=1`
+2. When enabled, library reads prefer DB `tracks.canonical_json` for that user and fall back to JSON only if DB is unavailable.
+
+Next DB-first implementation steps:
+1. Add `track_sources` migration and storage helpers.
+2. Write scan ingest into `track_sources` per user/agent.
+3. Read canonical `tracks` through preferred `track_sources` when DB-backed reads are enabled.
+4. Track canonical `tracks` separately from observed files.
+5. Move favorites/hidden/playability to canonical `tracks`.
+6. Use full replace-scans to mark unseen `track_sources` unavailable so broken/missing file instances can be identified systematically.

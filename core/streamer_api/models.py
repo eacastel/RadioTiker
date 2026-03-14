@@ -91,3 +91,21 @@ class MetadataResetPayload(BaseModel):
     track_ids: Optional[List[str]] = None
     clear_provider_snapshots: Optional[bool] = False
     clear_overrides: Optional[bool] = False
+
+
+class MetadataAlbumResetPayload(BaseModel):
+    album: str
+    artist: Optional[str] = None
+    clear_provider_snapshots: Optional[bool] = True
+    clear_overrides: Optional[bool] = True
+
+
+class MobileNextPayload(BaseModel):
+    current_track_id: Optional[str] = None
+    recent_track_ids: Optional[List[str]] = None
+
+
+class TrackHealthScanPayload(BaseModel):
+    limit: Optional[int] = 25
+    track_ids: Optional[List[str]] = None
+    include_ok: Optional[bool] = False
